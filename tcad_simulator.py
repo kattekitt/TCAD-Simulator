@@ -70222,9 +70222,40 @@ def _webui_worker_main(
                     axis = "Z"
                     index_max = int(model.grid.shape[2] - 1)
                 index = int(clamp(index, 0, index_max))
-                if kind not in {"material", "grid", "cross"}:
-                    kind = "material"
-                section = model.get_cross_section(axis, index).astype(np.uint16, copy=False)
+                # Quantitative WebUI concentration slices (cm^-3).
+                # Species fields are distinct from the material identity grid.
+                species_key = str(payload.get("species", "total") or "total").strip()
+                is_doping = kind == "doping"
+                if is_doping:
+                    model._ensure_doping_field()
+                    fields = getattr(model, "dopant_species_fields", {}) or {}
+                    if species_key.lower() == "total":
+                        dopant_array = model.doping
+                    elif species_key.lower() == "active":
+                        dopant_array = getattr(model, "active_dopants", None)
+                        if dopant_array is None:
+                            dopant_array = np.zeros(model.grid.shape, dtype=np.float32)
+                    elif species_key.lower() == "net":
+                        dopant_array = np.zeros(model.grid.shape, dtype=np.float32)
+                        for sym, arr in fields.items():
+                            if str(sym).upper() in {"P", "AS", "SB"}:
+                                dopant_array += arr
+                            elif str(sym).upper() in {"B", "AL", "GA", "IN"}:
+                                dopant_array -= arr
+                    else:
+                        symbol = species_key.upper()
+                        dopant_array = next((arr for key, arr in fields.items() if str(key).upper() == symbol), None)
+                        if dopant_array is None:
+                            dopant_array = np.zeros(model.grid.shape, dtype=np.float32)
+                    if axis == "X":
+                        section = dopant_array[index, :, :].T
+                    elif axis == "Y":
+                        section = dopant_array[:, index, :].T
+                    else:
+                        section = dopant_array[:, :, index]
+                    section = np.ascontiguousarray(section, dtype=np.float32)
+                else:
+                    section = model.get_cross_section(axis, index).astype(np.uint16, copy=False)
                 # Align WebUI 2D preview axes with 3D convention (X-right, Y-up on the XoY wafer plane).
                 # For Z slices, transpose to show X horizontally and Y vertically.
                 if axis == "Z":
@@ -70234,7 +70265,10 @@ def _webui_worker_main(
                     "index": int(index),
                     "index_max": int(index_max),
                     "shape": [int(section.shape[0]), int(section.shape[1])],
-                    "dtype": "u16",
+                    "dtype": "f32" if is_doping else "u16",
+                    "kind": "doping" if is_doping else "material",
+                    "species": species_key if is_doping else None,
+                    "units": "cm^-3" if is_doping else None,
                     "data_b64": base64.b64encode(section.tobytes(order="C")).decode("ascii"),
                 }
                 conn.send({"ok": True, "result": payload_out, "rid": rid})
@@ -71401,7 +71435,8 @@ class _WebUIRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 index = 0
             kind = str(query.get("kind", ["material"])[0]).strip().lower()
-            resp = sess.rpc("slice", {"axis": axis, "index": index, "kind": kind}, timeout_s=120.0)
+            species = str(query.get("species", ["total"])[0]).strip()
+            resp = sess.rpc("slice", {"axis": axis, "index": index, "kind": kind, "species": species}, timeout_s=120.0)
             self._send_json(resp, status=200, set_cookie=set_cookie)
             return
 
@@ -80933,6 +80968,26 @@ _WEBUI_INDEX_HTML = r"""<!DOCTYPE html>
                   <input id="slice-multi-toggle" type="checkbox" />
                   多轴
                 </label>
+                <label for="slice-field-select" style="font-size:12px;display:flex;align-items:center;gap:5px;">Display
+                  <select id="slice-field-select" title="2D material or dopant concentration field" style="max-width:200px;">
+                    <option value="material">Materials</option>
+                    <option value="total">Total doping (cm⁻³)</option>
+                    <option value="active">Active doping (cm⁻³)</option>
+                    <option value="net">Net N_D − N_A (cm⁻³)</option>
+                    <option value="B">Boron (B)</option>
+                    <option value="P">Phosphorus (P)</option>
+                    <option value="As">Arsenic (As)</option>
+                    <option value="Sb">Antimony (Sb)</option>
+                    <option value="Al">Aluminium (Al)</option>
+                    <option value="Ga">Gallium (Ga)</option>
+                  </select>
+                </label>
+                <label for="doping-scale-select" style="font-size:12px;display:flex;align-items:center;gap:5px;" title="Doping colour scale: integer powers of ten, with zero concentration shown as dark background">Scale
+                  <select id="doping-scale-select" title="Doping heatmap logarithmic scale">
+                    <option value="fixed0" selected>From 10⁰ cm⁻³</option>
+                    <option value="auto">Auto decades</option>
+                  </select>
+                </label>
                 <button class="btn btn-sm" id="refresh-slice-btn">刷新切片</button>
               </div>
 
@@ -82818,6 +82873,7 @@ const state = {
       sliceStepOverrides2: {}, // second slice per-step overrides
       // 2D multi-axis slice preview (show X/Y/Z slices simultaneously in a grid).
       slice2dMulti: false,
+      dopingScaleMode: 'auto', // 'fixed0' (10^0 baseline) or 'auto' (whole decades)
       slice2dAxes: { X: true, Y: false, Z: false },
       slice2dIndexX: 0,
       slice2dIndexY: 0,
@@ -86524,6 +86580,16 @@ function applyUiStateFromServer(ui) {
         state.sliceIndex2 = clampInt(idx2, 0, max2);
         changed = true;
       } catch (e) {}
+      // Concentration colour scaling (a purely visual preference).
+      try {
+        const mode = ui.dopingScaleMode || ui.doping_scale_mode;
+        if (mode === 'auto' || mode === 'fixed0') {
+          state.dopingScaleMode = mode;
+          const el = $('doping-scale-select');
+          if (el) el.value = mode;
+          changed = true;
+        }
+      } catch (e) {}
       // 2D multi-axis slice preview (optional).
       try {
         const has = ('slice2dMulti' in ui) || ('slice_2d_multi' in ui) || ('sliceMulti2d' in ui) || ('slice_multi_2d' in ui);
@@ -86616,6 +86682,7 @@ function collectUiState() {
         sliceAxis2: _sanitizeSliceAxis(state.sliceAxis2),
         sliceIndex2: clampInt(state.sliceIndex2, 0, axisMax(state.sliceAxis2)),
         slice2dMulti: !!state.slice2dMulti,
+        dopingScaleMode: state.dopingScaleMode === 'auto' ? 'auto' : 'fixed0',
         slice2dAxes: ax,
         slice2dIndexX: clampInt(state.slice2dIndexX, 0, axisMax('X')),
         slice2dIndexY: clampInt(state.slice2dIndexY, 0, axisMax('Y')),
@@ -96288,6 +96355,7 @@ function _b64ToBytes(b64) {
 }
 
 function renderLegendForSlice(dataU16OrList) {
+  if (selectedSliceField().kind !== 'material') { updateSliceLegend(); return; }
   const legend = $('materials-legend');
   if (!legend) return;
   const present = new Set();
@@ -96363,6 +96431,31 @@ function renderLegendForSlice(dataU16OrList) {
       }
     }
 
+    // Integer-decade logarithmic concentration scales.
+    // Exact zero (and sub-1 cm^-3 numerical noise) is shown as the dark background,
+    // because log10(0) is undefined. The fixed baseline 10^0 cm^-3 is therefore
+    // the lowest *positive* plotted concentration, not a claim that log10(0) = 0.
+    function dopingSliceStats(slice) {
+      if (!slice || !slice.doping || !slice.data) return null;
+      let negative = 0, positive = 0, nonzero = 0;
+      let rawMin = Infinity, rawMax = 0;
+      for (let i = 0; i < slice.data.length; i++) {
+        const v = Number(slice.data[i]);
+        if (!Number.isFinite(v) || Math.abs(v) < 1) continue;
+        negative += (v < 0 ? 1 : 0); positive += (v > 0 ? 1 : 0);
+        const a = Math.abs(v); rawMin = Math.min(rawMin, a); rawMax = Math.max(rawMax, a);
+        nonzero++;
+      }
+      const fixed0 = state.dopingScaleMode !== 'auto';
+      if (!nonzero) return {nonzero:0, positive:0, negative:0, rawMin:0, rawMax:0, lo:0, hi:1, distinct:false};
+      const logMin = Math.log10(rawMin), logMax = Math.log10(rawMax);
+      const distinct = (logMax - logMin > 0.05);
+      // Outward rounding prevents clipping any data and guarantees integer labels.
+      let lo = fixed0 ? 0 : Math.floor(logMin + 1e-6);
+      //let lo = Math.floor(logMin);
+      let hi = Math.max(lo + 1, Math.ceil(logMax - 1e-6));
+      return {nonzero, positive, negative, rawMin, rawMax, lo, hi, distinct};
+    }
             function drawSliceToCanvas(slice, canvas, opts = null) {
               if (!canvas) return;
               if (!sliceOffCanvas) {
@@ -96582,6 +96675,7 @@ function renderLegendForSlice(dataU16OrList) {
       const h = slice.h | 0;
       const data = slice.data;
       if (!w || !h || !data || !data.length) return;
+      const dopingStats = slice.doping ? dopingSliceStats(slice) : null;
 
       const axisForTransform = String(slice.axis || state.sliceAxis || 'X').toUpperCase();
       const tr = getSliceTransform(axisForTransform);
@@ -96608,7 +96702,7 @@ function renderLegendForSlice(dataU16OrList) {
         const row = y * w;
         const yb = (h - 1 - y); // vertical flip: row0 -> bottom
         for (let x = 0; x < w; x++) {
-          const id = data[row + x] | 0;
+          const id = slice.doping ? Number(data[row + x]) : (data[row + x] | 0);
           const xb = x;
 
           // swap
@@ -96626,6 +96720,13 @@ function renderLegendForSlice(dataU16OrList) {
           if (mirV) y2 = (hOut - 1 - y2);
 
           const di = (y2 * wOut + x2) | 0;
+          if (slice.doping) {
+            if (!Number.isFinite(id) || Math.abs(id) < 1) { out32[di] = bg32; continue; }
+            const t = Math.max(0, Math.min(1, (Math.log10(Math.abs(id)) - dopingStats.lo) / Math.max(0.001, dopingStats.hi - dopingStats.lo)));
+            const [r, g, b] = dopingRgbAt(t, slice.species === 'net' && id < 0);
+            out32[di] = (r | (g << 8) | (b << 16) | (255 << 24)) >>> 0;
+            continue;
+          }
           if (!id) { out32[di] = bg32; continue; }
           if (id <= maxId) { out32[di] = lut32[id] || magenta32; continue; }
           out32[di] = magenta32;
@@ -96701,6 +96802,115 @@ function renderLegendForSlice(dataU16OrList) {
       _sliceTimer = setTimeout(() => { refreshSlice(false, _sliceTimerWhich); }, Math.max(0, delayMs));
     }
 
+    document.addEventListener('change', (ev) => {
+      if (ev.target && ev.target.id === 'slice-field-select') {
+        try { refreshSlice(true, 'multi'); } catch (e) {}
+      }
+      if (ev.target && ev.target.id === 'doping-scale-select') {
+        state.dopingScaleMode = ev.target.value === 'auto' ? 'auto' : 'fixed0';
+        // Recolor already-loaded slices; no simulation or data transfer is required.
+        try { drawSliceFromCache(); } catch (e) {}
+        try { updateSliceLegend(); } catch (e) {}
+        try { scheduleUiStatePersist(520); } catch (e) {}
+      }
+    });
+    function selectedSliceField() {
+      const el = $('slice-field-select');
+      const v = el ? String(el.value || 'material') : 'material';
+      return {kind: v === 'material' ? 'material' : 'doping', species: v};
+    }
+    function decodeSliceResponse(r, axis, idx) {
+      const shape = r.shape || [0, 0];
+      const h = parseInt(shape[0]) || 0;
+      const ww = parseInt(shape[1]) || 0;
+      const bytes = _b64ToBytes(r.data_b64 || '');
+      const doping = r.dtype === 'f32';
+      const stride = doping ? 4 : 2;
+      if (!h || !ww || bytes.byteLength < (h * ww * stride)) throw new Error('slice data invalid');
+      // Ensure alignment even if the base64 decoder's byteOffset is unaligned.
+      const aligned = bytes.slice(0, h * ww * stride);
+      const data = doping ? new Float32Array(aligned.buffer) : new Uint16Array(aligned.buffer);
+      const ax = String(r.axis || axis).toUpperCase();
+      const ii = parseInt(r.index) || idx;
+      const mx = parseInt(r.index_max);
+      return {axis: ax, index: ii, index_max: Number.isFinite(mx) ? mx : axisMax(ax), w: ww, h, data, doping, species: r.species || 'total'};
+    }
+    // Show integer-decade ticks along a continuous magnitude colour bar.
+    // CUSTOM_DOPING_COLORMAP_START
+    // Paste your Matplotlib RGB lookup table here (usually 256 [R,G,B] entries).
+    // Empty array = use the simulator's original blue -> yellow gradient.
+
+    // Example: const DOPING_COLORMAP = [[68,1,84], [253,231,37]];
+    const DOPING_COLORMAP = [[48, 18, 59], [50, 21, 67], [51, 24, 74], [52, 27, 81], [53, 30, 88], [54, 33, 95], [55, 36, 102], [56, 39, 109], [57, 42, 115], [58, 45, 121], [59, 47, 128], [60, 50, 134], [61, 53, 139], [62, 56, 145], [63, 59, 151], [63, 62, 156], [64, 64, 162], [65, 67, 167], [65, 70, 172], [66, 73, 177], [66, 75, 181], [67, 78, 186], [68, 81, 191], [68, 84, 195], [68, 86, 199], [69, 89, 203], [69, 92, 207], [69, 94, 211], [70, 97, 214], [70, 100, 218], [70, 102, 221], [70, 105, 224], [70, 107, 227], [71, 110, 230], [71, 113, 233], [71, 115, 235], [71, 118, 238], [71, 120, 240], [71, 123, 242], [70, 125, 244], [70, 128, 246], [70, 130, 248], [70, 133, 250], [70, 135, 251], [69, 138, 252], [69, 140, 253], [68, 143, 254], [67, 145, 254], [66, 148, 255], [65, 150, 255], [64, 153, 255], [62, 155, 254], [61, 158, 254], [59, 160, 253], [58, 163, 252], [56, 165, 251], [55, 168, 250], [53, 171, 248], [51, 173, 247], [49, 175, 245], [47, 178, 244], [46, 180, 242], [44, 183, 240], [42, 185, 238], [40, 188, 235], [39, 190, 233], [37, 192, 231], [35, 195, 228], [34, 197, 226], [32, 199, 223], [31, 201, 221], [30, 203, 218], [28, 205, 216], [27, 208, 213], [26, 210, 210], [26, 212, 208], [25, 213, 205], [24, 215, 202], [24, 217, 200], [24, 219, 197], [24, 221, 194], [24, 222, 192], [24, 224, 189], [25, 226, 187], [25, 227, 185], [26, 228, 182], [28, 230, 180], [29, 231, 178], [31, 233, 175], [32, 234, 172], [34, 235, 170], [37, 236, 167], [39, 238, 164], [42, 239, 161], [44, 240, 158], [47, 241, 155], [50, 242, 152], [53, 243, 148], [56, 244, 145], [60, 245, 142], [63, 246, 138], [67, 247, 135], [70, 248, 132], [74, 248, 128], [78, 249, 125], [82, 250, 122], [85, 250, 118], [89, 251, 115], [93, 252, 111], [97, 252, 108], [101, 253, 105], [105, 253, 102], [109, 254, 98], [113, 254, 95], [117, 254, 92], [121, 254, 89], [125, 255, 86], [128, 255, 83], [132, 255, 81], [136, 255, 78], [139, 255, 75], [143, 255, 73], [146, 255, 71], [150, 254, 68], [153, 254, 66], [156, 254, 64], [159, 253, 63], [161, 253, 61], [164, 252, 60], [167, 252, 58], [169, 251, 57], [172, 251, 56], [175, 250, 55], [177, 249, 54], [180, 248, 54], [183, 247, 53], [185, 246, 53], [188, 245, 52], [190, 244, 52], [193, 243, 52], [195, 241, 52], [198, 240, 52], [200, 239, 52], [203, 237, 52], [205, 236, 52], [208, 234, 52], [210, 233, 53], [212, 231, 53], [215, 229, 53], [217, 228, 54], [219, 226, 54], [221, 224, 55], [223, 223, 55], [225, 221, 55], [227, 219, 56], [229, 217, 56], [231, 215, 57], [233, 213, 57], [235, 211, 57], [236, 209, 58], [238, 207, 58], [239, 205, 58], [241, 203, 58], [242, 201, 58], [244, 199, 58], [245, 197, 58], [246, 195, 58], [247, 193, 58], [248, 190, 57], [249, 188, 57], [250, 186, 57], [251, 184, 56], [251, 182, 55], [252, 179, 54], [252, 177, 54], [253, 174, 53], [253, 172, 52], [254, 169, 51], [254, 167, 50], [254, 164, 49], [254, 161, 48], [254, 158, 47], [254, 155, 45], [254, 153, 44], [254, 150, 43], [254, 147, 42], [254, 144, 41], [253, 141, 39], [253, 138, 38], [252, 135, 37], [252, 132, 35], [251, 129, 34], [251, 126, 33], [250, 123, 31], [249, 120, 30], [249, 117, 29], [248, 114, 28], [247, 111, 26], [246, 108, 25], [245, 105, 24], [244, 102, 23], [243, 99, 21], [242, 96, 20], [241, 93, 19], [240, 91, 18], [239, 88, 17], [237, 85, 16], [236, 83, 15], [235, 80, 14], [234, 78, 13], [232, 75, 12], [231, 73, 12], [229, 71, 11], [228, 69, 10], [226, 67, 10], [225, 65, 9], [223, 63, 8], [221, 61, 8], [220, 59, 7], [218, 57, 7], [216, 55, 6], [214, 53, 6], [212, 51, 5], [210, 49, 5], [208, 47, 5], [206, 45, 4], [204, 43, 4], [202, 42, 4], [200, 40, 3], [197, 38, 3], [195, 37, 3], [193, 35, 2], [190, 33, 2], [188, 32, 2], [185, 30, 2], [183, 29, 2], [180, 27, 1], [178, 26, 1], [175, 24, 1], [172, 23, 1], [169, 22, 1], [167, 20, 1], [164, 19, 1], [161, 18, 1], [158, 16, 1], [155, 15, 1], [152, 14, 1], [149, 13, 1], [146, 11, 1], [142, 10, 1], [139, 9, 2], [136, 8, 2], [133, 7, 2], [129, 6, 2], [126, 5, 2], [122, 4, 3]];
+
+        // Normalize and validate the table once, not once per displayed pixel.
+    const DOPING_COLOR_TABLE = (
+      Array.isArray(DOPING_COLORMAP) && DOPING_COLORMAP.length >= 2 &&
+      DOPING_COLORMAP.every(c => Array.isArray(c) && c.length >= 3 &&
+        c.slice(0, 3).every(v => Number.isFinite(Number(v))))
+    ) ? DOPING_COLORMAP.map(c => c.slice(0, 3).map(v =>
+      Math.max(0, Math.min(255, Math.round(Number(v)))))) : null;
+    function dopingRgbAt(t, negativeNet) {
+      // Preserve the simulator's distinct pink palette for acceptor-dominated net doping.
+      if (negativeNet) return [
+        Math.round(155 + 95 * t), Math.round(75 + 120 * t),
+        Math.round(115 + 110 * t)
+      ];
+      if (DOPING_COLOR_TABLE) {
+        const i = Math.max(0, Math.min(DOPING_COLOR_TABLE.length - 1,
+          Math.round(t * (DOPING_COLOR_TABLE.length - 1))));
+        return DOPING_COLOR_TABLE[i];
+      }
+      return [Math.round(35 + 220 * t), Math.round(75 + 120 * t),
+              Math.round(230 - 170 * t)];
+    }
+    function dopingGradientCss() {
+      if (!DOPING_COLOR_TABLE) {
+        return 'linear-gradient(to right,rgb(35,75,230),rgb(255,195,60))';
+      }
+      const n = DOPING_COLOR_TABLE.length - 1;
+      const stops = DOPING_COLOR_TABLE.map((rgb, i) =>
+        'rgb(' + rgb.join(',') + ') ' + (100 * i / n).toFixed(2) + '%');
+      return 'linear-gradient(to right,' + stops.join(',') + ')';
+    }
+    // CUSTOM_DOPING_COLORMAP_END
+    function dopingDecadeLegendHtml(st) {
+      if (!st || !st.nonzero) return '';
+      const span = Math.max(1, st.hi - st.lo);
+      const step = Math.max(1, Math.ceil(span / 6));
+      const exps = [st.lo];
+      for (let e = st.lo + step; e < st.hi; e += step) exps.push(e);
+      exps.push(st.hi);
+      const ticks = exps.map(e => '<span>10<sup>' + e + '</sup></span>').join('');
+      return '<div style="margin-top:8px;max-width:300px">' +
+        '<div style="height:12px;border:1px solid rgba(255,255,255,.45);border-radius:2px;' +
+        'background:' + dopingGradientCss() + '"></div>' +
+        '<div style="display:flex;justify-content:space-between;font-size:11px;margin-top:3px">' + ticks + '</div>' +
+        '<div style="font-size:11px;margin-top:2px">Magnitude (cm⁻³); 0 = dark background</div></div>';
+    }
+    function updateSliceLegend() {
+      const el = $('materials-legend');
+      if (!el) return;
+      const field = selectedSliceField();
+      if (field.kind === 'material') return;
+      const slices = [state.slice2dLastX, state.slice2dLastY, state.slice2dLastZ, state.sliceLast].filter(x => x && x.doping && x.species === field.species);
+      const slice = slices.length ? slices[slices.length-1] : null;
+      const st = dopingSliceStats(slice);
+      let message = 'No concentration slice loaded';
+      if (st && st.nonzero) {
+        message = 'Min nonzero: ' + st.rawMin.toExponential(2) + ' cm⁻³<br>Max: ' + st.rawMax.toExponential(2) + ' cm⁻³<br>' +
+          'Colour range: 10^' + st.lo + ' to 10^' + st.hi + ' cm⁻³ (integer decades)<br>' +
+          'Zero / |N| &lt; 1 cm⁻³: dark background<br>' +
+          'Nonzero voxels: ' + st.nonzero;
+        if (!st.distinct) message += '<br><b>Nearly uniform concentration in this slice</b>';
+        if (field.species === 'net') message += '<br>Donor voxels: ' + st.positive + '; acceptor voxels: ' + st.negative;
+      } else if (st) message = 'No nonzero dopant concentrations on this slice';
+      el.innerHTML = '<div style="padding:5px;color:white;line-height:1.5;font-size:13px">' +
+        '<b>Concentration: ' + field.species + '</b><br>log₁₀(|N| / cm⁻³)<br>' +
+        (DOPING_COLOR_TABLE ? '<span>Custom colormap: low → high</span>' : '<span style="color:#91caff">Blue: low</span> → <span style="color:#ffca62">Yellow: high</span>') +
+        (field.species === 'net' ? '<br>Pink: acceptor dominated' : '') + '<br>' + message +
+        dopingDecadeLegendHtml(st) + '</div>';
+    }
     async function refreshSlice(force = false, which = 'auto') {
       const allow = (state.viewerMode === '2d') || (state.viewerMode === '3d' && state.sliceOverlay);
       if (!allow) return;
@@ -96730,24 +96940,14 @@ function renderLegendForSlice(dataU16OrList) {
           const axis = String(axis0 || 'X').toUpperCase();
           const idx = clampInt(idx0 || 0, 0, axisMax(axis));
           const resp = await apiGet(
-            `/api/slice?axis=${encodeURIComponent(axis)}&index=${encodeURIComponent(idx)}&kind=material`,
+            `/api/slice?axis=${encodeURIComponent(axis)}&index=${encodeURIComponent(idx)}&kind=${selectedSliceField().kind}&species=${encodeURIComponent(selectedSliceField().species)}`,
             0,
             sig ? { signal: sig } : null
           );
           if (isStale()) return null;
           if (!resp.ok) throw new Error(resp.error || 'slice failed');
           const r = resp.result || {};
-          const shape = r.shape || [0, 0];
-          const h = parseInt(shape[0]) || 0;
-          const ww = parseInt(shape[1]) || 0;
-          const bytes = _b64ToBytes(r.data_b64 || '');
-          if (!h || !ww || bytes.byteLength < (h * ww * 2)) throw new Error('slice data invalid');
-          const u16 = new Uint16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
-          const data = u16.slice(0, h * ww);
-          const ax1 = String(r.axis || axis).toUpperCase();
-          const ii = parseInt(r.index) || idx;
-          const mx = parseInt(r.index_max);
-          return { axis: ax1, index: ii, index_max: Number.isFinite(mx) ? mx : axisMax(ax1), w: ww, h, data };
+          return decodeSliceResponse(r, axis, idx);
         }
 
         if (!state.videoExporting) showNotification('加载切片中...');
@@ -96775,17 +96975,17 @@ function renderLegendForSlice(dataU16OrList) {
         if (resX) {
           state.slice2dIndexX = resX.index;
           state.slice2dMaxX = resX.index_max;
-          state.slice2dLastX = { axis: resX.axis, index: resX.index, w: resX.w, h: resX.h, data: resX.data };
+          state.slice2dLastX = { axis: resX.axis, index: resX.index, w: resX.w, h: resX.h, data: resX.data, doping: resX.doping, species: resX.species };
         }
         if (resY) {
           state.slice2dIndexY = resY.index;
           state.slice2dMaxY = resY.index_max;
-          state.slice2dLastY = { axis: resY.axis, index: resY.index, w: resY.w, h: resY.h, data: resY.data };
+          state.slice2dLastY = { axis: resY.axis, index: resY.index, w: resY.w, h: resY.h, data: resY.data, doping: resY.doping, species: resY.species };
         }
         if (resZ) {
           state.slice2dIndexZ = resZ.index;
           state.slice2dMaxZ = resZ.index_max;
-          state.slice2dLastZ = { axis: resZ.axis, index: resZ.index, w: resZ.w, h: resZ.h, data: resZ.data };
+          state.slice2dLastZ = { axis: resZ.axis, index: resZ.index, w: resZ.w, h: resZ.h, data: resZ.data, doping: resZ.doping, species: resZ.species };
         }
 
         try { syncSliceControls2dMulti(false); } catch (e) {}
@@ -96795,7 +96995,7 @@ function renderLegendForSlice(dataU16OrList) {
           if (ax.X && state.slice2dLastX && state.slice2dLastX.data) parts.push(state.slice2dLastX.data);
           if (ax.Y && state.slice2dLastY && state.slice2dLastY.data) parts.push(state.slice2dLastY.data);
           if (ax.Z && state.slice2dLastZ && state.slice2dLastZ.data) parts.push(state.slice2dLastZ.data);
-          if (parts.length) renderLegendForSlice(parts);
+          if (selectedSliceField().kind === 'material' && parts.length) renderLegendForSlice(parts); else updateSliceLegend();
         } catch (e) {}
         if (!state.videoExporting) {
           const parts = [];
@@ -96823,24 +97023,14 @@ function renderLegendForSlice(dataU16OrList) {
         const axis = String(axis0 || 'X').toUpperCase();
         const idx = clampInt(idx0 || 0, 0, axisMax(axis));
         const resp = await apiGet(
-          `/api/slice?axis=${encodeURIComponent(axis)}&index=${encodeURIComponent(idx)}&kind=material`,
+          `/api/slice?axis=${encodeURIComponent(axis)}&index=${encodeURIComponent(idx)}&kind=${selectedSliceField().kind}&species=${encodeURIComponent(selectedSliceField().species)}`,
           0,
           sig ? { signal: sig } : null
         );
         if (isStale()) return null;
         if (!resp.ok) throw new Error(resp.error || 'slice failed');
         const r = resp.result || {};
-        const shape = r.shape || [0, 0];
-        const h = parseInt(shape[0]) || 0;
-        const ww = parseInt(shape[1]) || 0;
-        const bytes = _b64ToBytes(r.data_b64 || '');
-        if (!h || !ww || bytes.byteLength < (h * ww * 2)) throw new Error('slice data invalid');
-        const u16 = new Uint16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
-        const data = u16.slice(0, h * ww);
-        const ax = String(r.axis || axis).toUpperCase();
-        const ii = parseInt(r.index) || idx;
-        const mx = parseInt(r.index_max);
-        return { axis: ax, index: ii, index_max: Number.isFinite(mx) ? mx : axisMax(ax), w: ww, h, data };
+        return decodeSliceResponse(r, axis, idx);
       }
 
       if (!state.videoExporting) showNotification('加载切片中...');
@@ -96868,13 +97058,13 @@ function renderLegendForSlice(dataU16OrList) {
         state.sliceAxis = res1.axis;
         state.sliceIndex = res1.index;
         state.sliceMax = res1.index_max;
-        state.sliceLast = { axis: res1.axis, index: res1.index, w: res1.w, h: res1.h, data: res1.data };
+        state.sliceLast = { axis: res1.axis, index: res1.index, w: res1.w, h: res1.h, data: res1.data, doping: res1.doping, species: res1.species };
       }
       if (res2) {
         state.sliceAxis2 = res2.axis;
         state.sliceIndex2 = res2.index;
         state.sliceMax2 = res2.index_max;
-        state.sliceLast2 = { axis: res2.axis, index: res2.index, w: res2.w, h: res2.h, data: res2.data };
+        state.sliceLast2 = { axis: res2.axis, index: res2.index, w: res2.w, h: res2.h, data: res2.data, doping: res2.doping, species: res2.species };
       }
 
       try { syncSliceControls(false); } catch (e) {}
