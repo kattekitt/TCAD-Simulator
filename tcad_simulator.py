@@ -4190,6 +4190,26 @@ def _canonical_species_symbol(species: str) -> str:
     return _canonical_species_key(species).upper()
 
 
+
+# Approximate LSS teaching references for implants in *flat, amorphous Si*.
+# Source: https://semirai.com/en/tools/ion-implant-profile-calculator
+# (B, P, As Rp and straggle data table; NOT an SRIM/TRIM calibration).
+# These are for quantitative warnings only: no trajectory is rescaled to fit.
+MC_SILICON_REFERENCE = {
+    "B": ((5, 10, 20, 50, 100, 200), (17, 33, 66, 161, 299, 523), (10, 17, 28, 50, 71, 96)),
+    "P": ((5, 10, 20, 50, 100, 200), (8, 14, 25, 61, 124, 254), (4, 7, 12, 26, 46, 78)),
+    "AS": ((5, 10, 20, 50, 100, 200), (6, 10, 16, 32, 58, 110), (2, 4, 6, 12, 21, 38)),
+}
+
+
+def _mc_si_reference(species: str, energy_kev: float) -> Optional[Tuple[float, float]]:
+    """Return approximate flat-Si projected range/straggle; None outside tabulated energy."""
+    item = MC_SILICON_REFERENCE.get(_canonical_species_symbol(species))
+    if not item or not (float(item[0][0]) <= energy_kev <= float(item[0][-1])):
+        return None
+    return (float(np.interp(energy_kev, item[0], item[1])),
+            float(np.interp(energy_kev, item[0], item[2])))
+
 def _species_params(species: str) -> Dict[str, float]:
     species_key = _canonical_species_key(species)
     record = IMPLANT_SPECIES_DB.get(species_key)
@@ -7378,6 +7398,60 @@ def _rasterize_polygons(
 # ---------------------------------------------------------------------------
 
 
+def _mc_gaussian_smooth_material_aware(field: np.ndarray, material: np.ndarray, sigma_vox: float) -> np.ndarray:
+    """Gaussian spatial averaging, separately within each material, conserving sum.
+
+    The operation is deliberately NOT a physical annealing/diffusion step.
+    Only occupied material IDs represented by nonzero input are processed.
+    """
+    sigma = float(sigma_vox)
+    if sigma <= 0.0 or not np.any(field):
+        return field
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    active = np.argwhere(field > 0)
+    lo = np.maximum(active.min(axis=0) - radius, 0)
+    hi = np.minimum(active.max(axis=0) + radius + 1, field.shape)
+    sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+    chunk = field[sl].astype(np.float64, copy=False)
+    mat_chunk = material[sl]
+    result = np.zeros_like(chunk)
+    # scipy is optional elsewhere in the simulator, so use a small separable fallback.
+    def blur(a: np.ndarray) -> np.ndarray:
+        if _scipy_ndimage is not None:
+            return _scipy_ndimage.gaussian_filter(a, sigma=sigma, mode="constant", cval=0.0, truncate=3.0)
+        xx = np.arange(-radius, radius + 1, dtype=np.float64)
+        kernel = np.exp(-0.5 * (xx / sigma) ** 2)
+        kernel /= kernel.sum()
+        out = a
+        for axis in range(3):
+            # Zero-padded separable convolution; np.apply_along_axis handles boundaries.
+            out = np.apply_along_axis(lambda v: np.convolve(np.pad(v, (radius, radius)), kernel, mode="valid"), axis, out)
+        return out
+    for mid in np.unique(mat_chunk[chunk > 0]):
+        if mid == 0:
+            continue
+        mask = (mat_chunk == mid)
+        values = np.where(mask, chunk, 0.0)
+        before = float(values.sum())
+        if before <= 0.0:
+            continue
+        # Division by blurred support corrects boundary attenuation; global
+        # normalization gives exact dose conservation for each material ID.
+        numerator = blur(values)
+        support = blur(mask.astype(np.float64))
+        averaged = np.zeros_like(numerator)
+        np.divide(numerator, support, out=averaged, where=support > 1e-14)
+        averaged *= mask
+        total = float(averaged.sum())
+        if total > 0:
+            result += averaged * (before / total)
+        else:
+            result += values
+    final = field.copy()
+    final[sl] = result.astype(field.dtype)
+    return final
+
+
 class ProcessModel:
     def __init__(
         self,
@@ -7499,6 +7573,7 @@ class ProcessModel:
         self.defects_interstitial = None
         self.defects_vacancy = None
         self.damage_concentration = None
+        self.mc_last_stops = None  # raw BCA stopping positions; no smoothing applied
         self.interstitials = None
         self.vacancies = None
         self.cluster_interstitial = None
@@ -8275,6 +8350,7 @@ class ProcessModel:
             "cluster_interstitial": _pack_field(getattr(self, "cluster_interstitial", None), "cluster_interstitial"),
             "cluster_bic": _pack_field(getattr(self, "cluster_bic", None), "cluster_bic"),
             "damage_concentration": _pack_field(getattr(self, "damage_concentration", None), "damage_concentration"),
+            "mc_last_stops": _pack_field(getattr(self, "mc_last_stops", None), "mc_last_stops"),
             # Always pack 2D fields: big on large domains and used heavily by undo/time-travel caches.
             "height_map": _pack_field(getattr(self, "height_map", None), "height_map"),
             "open_mask": _pack_field(getattr(self, "open_mask", None), "open_mask"),
@@ -8456,6 +8532,7 @@ class ProcessModel:
         self.cluster_interstitial = _unpack_field(state.get("cluster_interstitial"))
         self.cluster_bic = _unpack_field(state.get("cluster_bic"))
         self.damage_concentration = _unpack_field(state.get("damage_concentration"))
+        self.mc_last_stops = _unpack_field(state.get("mc_last_stops"))
         # Legacy keys from older snapshots: accept and map if present.
         legacy_def_i = _unpack_field(state.get("defects_interstitial"))
         legacy_def_v = _unpack_field(state.get("defects_vacancy"))
@@ -9681,6 +9758,72 @@ class ProcessModel:
             )
         )
 
+    def lift_off(self, deposited_material: str = "Nickel", resist_material: str = "Photoresist") -> Dict[str, int]:
+        """Idealized, column-supported metal lift-off.
+
+        Every selected-film voxel vertically above remaining patterned resist
+        is removed together with the resist. Selected-film voxels in columns
+        without resist remain untouched. This is a geometric approximation
+        appropriate to directional deposition, NOT a resist-undercut/fracture
+        model; connected bridging films are not mechanically resolved.
+        """
+        film_name = _resolve_material_name_any(self.material_db, deposited_material)
+        resist_name = _resolve_material_name_any(self.material_db, resist_material)
+        if not film_name or not resist_name:
+            raise ValueError("Lift-off requires valid deposited-film and photoresist materials.")
+        film_id = int(self.material_db.id_for(film_name))
+        resist_id = int(self.material_db.id_for(resist_name))
+        if film_id == resist_id or film_id == 0 or resist_id == 0:
+            raise ValueError("Lift-off requires distinct, non-void resist and deposited-film materials.")
+
+        grid = self.grid
+        resist = (grid == resist_id)
+        n_resist = int(np.count_nonzero(resist))
+        if n_resist == 0:
+            self._log("Lift-off skipped: no {} remains.".format(resist_name))
+            return {"resist_removed": 0, "film_removed": 0, "film_retained": int(np.count_nonzero(grid == film_id))}
+
+        # Highest resist voxel in each vertical column. An upper metal cap
+        # is resist-supported even when a void separates it from the resist.
+        # All film voxels on columns WITHOUT resist, including the metal in
+        # developed openings, are left untouched.
+        nz = int(grid.shape[2])
+        top_resist = np.where(
+            resist.any(axis=2),
+            nz - 1 - np.argmax(resist[:, :, ::-1], axis=2),
+            -1,
+        ).astype(np.int32, copy=False)
+        film_to_remove = (grid == film_id) & (
+            np.arange(nz, dtype=np.int32)[None, None, :] > top_resist[:, :, None]
+        ) & (top_resist[:, :, None] >= 0)
+        film_removed = int(np.count_nonzero(film_to_remove))
+        removal = resist | film_to_remove
+        grid[removal] = 0
+
+        # Other process fields should never retain values in voids.
+        for name in (
+            "doping", "active_dopants", "damage_concentration", "interstitials",
+            "vacancies", "cluster_interstitial", "cluster_bic", "mc_last_stops",
+        ):
+            field = getattr(self, name, None)
+            if isinstance(field, np.ndarray) and field.shape == grid.shape:
+                field[removal] = 0
+        self._clear_dopant_species_mask((slice(None), slice(None), slice(None)), removal)
+        state = getattr(self, "_resist_state", None)
+        if state is not None:
+            for name in ("acid_conc", "base_conc", "polymer_fraction", "pag_fraction", "pac_fraction"):
+                field = getattr(state, name, None)
+                if isinstance(field, np.ndarray) and field.shape == grid.shape:
+                    field[removal] = 0
+
+        # Recompute the top surface, since resist and its metal caps vanished.
+        self._rebuild_height_map(dirty_materials=[film_id, resist_id])
+        retained = int(np.count_nonzero(grid == film_id))
+        self._log("Lift-off {} on {}: removed {} resist voxels, {} film voxels; retained {} film voxels".format(
+            film_name, resist_name, n_resist, film_removed, retained
+        ))
+        return {"resist_removed": n_resist, "film_removed": film_removed, "film_retained": retained}
+
     # -- deposition -------------------------------------------------------------
 
     def deposit_material(
@@ -9697,6 +9840,7 @@ class ProcessModel:
         source_sigma: float = 0.6,
         surface_diff_nm: float = 120.0,
         resputter_prob: float = 0.02,
+        pvd_controls: str = "Advanced",
         dopant_element: str = "",
         dopant_concentration_cm3: float = 0.0,
         dopant_mode: str = "Max",
@@ -9724,6 +9868,14 @@ class ProcessModel:
         except Exception:
             cov_frac = 0.0
         pre_height = self.height_map.copy()
+        # Snapshot material occupancy only when in-situ incorporation is requested.
+        # Unlike a height-based approximation, this captures trench/sidewall growth
+        # without modifying already existing material of the same type.
+        wants_in_situ = (method.lower() in {"ald", "cvd", "epitaxy"}
+                         and str(dopant_element or "").strip().lower() not in {"", "none"}
+                         and np.isfinite(float(dopant_concentration_cm3 or 0.0))
+                         and float(dopant_concentration_cm3 or 0.0) > 0.0)
+        pre_material_mask = (self.grid == np.uint16(mat_id)) if wants_in_situ else None
         start_time = time.perf_counter()
 
         added_voxels = 0
@@ -9748,6 +9900,8 @@ class ProcessModel:
                     mat_id,
                     coverage_mask,
                     thickness_nm,
+                    directionality=directionality,
+                    pvd_controls=pvd_controls,
                     sticking=sticking,
                     source_sigma=source_sigma,
                     surface_diff_nm=surface_diff_nm,
@@ -9780,33 +9934,22 @@ class ProcessModel:
         self._invalidate_mesh_cache([mat_id])
 
         dopant_voxels = 0
-        try:
-            # Default: ALD dopant is a shallow, top-layer incorporation model.
-            if method_key == "ald":
-                dopant_voxels = int(
-                    self._apply_deposition_dopant_top_layers(
-                        mat_id,
-                        coverage_mask,
-                        thickness_nm,
-                        str(dopant_element or ""),
-                        float(dopant_concentration_cm3 or 0.0),
-                        str(dopant_mode or "Max"),
-                    )
-                )
-            # Flowable dopant glass (SOD): dopants should be present throughout the connected
-            # deposited volume, including inside 3D cavities/holes that are filled by flow.
-            elif str(getattr(material, "name", "") or "").strip().upper() == "SOD":
-                dopant_voxels = int(
-                    self._apply_deposition_dopant_flowable_volume(
-                        mat_id,
-                        coverage_mask,
-                        str(dopant_element or ""),
-                        float(dopant_concentration_cm3 or 0.0),
-                        str(dopant_mode or "Max"),
-                    )
-                )
-        except Exception:
-            dopant_voxels = 0
+        # Incorporate dopant only into voxels created by this deposition.
+        # This includes non-horizontal surfaces and never dopes the substrate.
+        if pre_material_mask is not None:
+            newly_deposited = (self.grid == np.uint16(mat_id)) & ~pre_material_mask
+            dopant_voxels = self._apply_deposition_dopant_new_voxels(
+                newly_deposited,
+                mat_id,
+                str(dopant_element or ""),
+                float(dopant_concentration_cm3 or 0.0),
+                str(dopant_mode or "Max"),
+            )
+        elif str(getattr(material, "name", "") or "").strip().upper() == "SOD":
+            # Preserve the existing flowable-glass model for its separate process.
+            dopant_voxels = int(self._apply_deposition_dopant_flowable_volume(
+                mat_id, coverage_mask, str(dopant_element or ""),
+                float(dopant_concentration_cm3 or 0.0), str(dopant_mode or "Max")))
         delta_layers = self.height_map.astype(np.int32, copy=False) - pre_height.astype(np.int32, copy=False)
         analysis_mask = coverage_mask & (pre_height > 0)
         delta_cols = delta_layers[analysis_mask]
@@ -9903,6 +10046,50 @@ class ProcessModel:
             }
         except Exception:
             pass
+
+    def _apply_deposition_dopant_new_voxels(
+        self,
+        new_voxels: np.ndarray,
+        material_id: int,
+        element_symbol: str,
+        concentration_cm3: float,
+        mode: str = "Max",
+    ) -> int:
+        """Incorporate a species only in voxels newly created by deposition.
+
+        `new_voxels` is the exact before/after material-occupancy difference.
+        The existing species fields, total doping and active doping are left
+        unchanged outside that mask.  Activation remains an idealised proxy.
+        """
+        element_symbol = self._dopant_element_symbol(str(element_symbol or "").strip())
+        if not element_symbol or element_symbol.lower() == "none":
+            return 0
+        conc = float(concentration_cm3)
+        if not np.isfinite(conc) or conc <= 0.0:
+            return 0
+        if not isinstance(new_voxels, np.ndarray) or new_voxels.shape != self.grid.shape:
+            raise ValueError("new_voxels must match the process grid")
+        mask = new_voxels & (self.grid == np.uint16(material_id))
+        count = int(np.count_nonzero(mask))
+        if not count:
+            return 0
+        mat = self.material_db.material(int(material_id))
+        is_semi = str(getattr(mat, "surface_group", "")).strip().lower() == "semiconductor"
+        self._ensure_doping_field()
+        if is_semi:
+            self._ensure_defect_fields()  # initialise active field before doping total changes
+        species = self._ensure_dopant_species_field(element_symbol)
+        old = species[mask].copy()
+        if str(mode or "Max").strip().lower() in {"add", "sum", "+", "accumulate"}:
+            new = old + np.float32(conc)
+        else:
+            new = np.maximum(old, np.float32(conc))
+        delta = new - old
+        species[mask] = new
+        self.doping[mask] += delta
+        if is_semi and isinstance(getattr(self, "active_dopants", None), np.ndarray):
+            self.active_dopants[mask] += delta
+        return count
 
     def _apply_deposition_dopant_top_layers(
         self,
@@ -10797,6 +10984,8 @@ class ProcessModel:
         coverage_mask: np.ndarray,
         thickness_nm: float,
         *,
+        directionality: float = 0.2,
+        pvd_controls: str = "Advanced",
         sticking: float,
         source_sigma: float,
         surface_diff_nm: float,
@@ -10821,6 +11010,20 @@ class ProcessModel:
         conformal_fraction += 0.25 * isotropy_factor
         conformal_fraction += 0.15 * resputter_prob
         conformal_fraction = float(np.clip(conformal_fraction, 0.0, 0.9))
+
+        # Simple PVD is deliberately controlled ONLY by directionality.
+        # Advanced uses the historical calibrated-as-proxy knobs unchanged.
+        # A legacy recipe without pvd_controls is migrated to Advanced on load.
+        if str(pvd_controls).strip().lower() == "simple":
+            d = float(np.clip(directionality, 0.0, 1.0))
+            conformal_fraction = 1.0 - d
+            # Do not let hidden advanced settings silently affect simple mode.
+            # Small angular spread with no lateral surface diffusion/resputtering
+            # approximates directional evaporation for lift-off teaching.
+            sticking = 1.0
+            source_sigma = 0.05
+            surface_diff_nm = 0.0
+            resputter_prob = 0.0
 
         conformal_thickness_nm = float(thickness_nm) * conformal_fraction
         directional_thickness_nm = float(thickness_nm) - conformal_thickness_nm
@@ -14618,12 +14821,18 @@ class ProcessModel:
         method: str = "Beam",
         bias_voltage_v: float = 0.0,
         plasma_density_cm3: float = 1e11,
+        mc_trajectories: int = 5000,
+        mc_deposition: str = "cic",
+        mc_smoothing_nm: float = 0.0,
+        mc_channeling: bool = False,
+        mc_electronic_stopping_multiplier: float = 1.0,
     ) -> None:
         if dose_cm2 <= 0.0:
             return
         self._ensure_defect_fields()
         method_key = method.lower()
         if method_key in {"beam", "plasma"}:
+            self.mc_last_stops = None
             self._implant_profile_distribution(
                 species,
                 dose_cm2,
@@ -14648,8 +14857,21 @@ class ProcessModel:
         voxel_volume_cm3 = voxel_cm ** 3
         area_per_site_cm2 = (voxel_cm) ** 2
         total_area_cm2 = area_per_site_cm2 * float(available_coords.shape[0])
-        total_ions = max(dose_cm2 * total_area_cm2, 1.0)
-        base_samples = int(max(2000, min(60000, total_ions / 1e10 + 2000)))
+        total_ions = dose_cm2 * total_area_cm2
+        # Monte Carlo sample count controls statistical precision, not the physical dose.
+        # Each trajectory carries total_ions / base_samples of the physical ion inventory.
+        base_samples = int(mc_trajectories)
+        if base_samples not in {2000, 5000, 10000, 20000, 50000}:
+            raise ValueError("MC trajectories must be 2000, 5000, 10000, 20000 or 50000")
+        mc_deposition = str(mc_deposition).strip().lower()
+        if mc_deposition not in {"nearest", "cic"}:
+            raise ValueError("MC deposition must be nearest or cic")
+        mc_smoothing_nm = float(mc_smoothing_nm)
+        if mc_smoothing_nm not in {0.0, 5.0, 10.0, 20.0}:
+            raise ValueError("MC smoothing must be 0, 5, 10 or 20 nm")
+        mc_electronic_stopping_multiplier = float(mc_electronic_stopping_multiplier)
+        if not (0.01 <= mc_electronic_stopping_multiplier <= 1000.0) or not math.isfinite(mc_electronic_stopping_multiplier):
+            raise ValueError("MC electronic stopping multiplier must be between 0.01 and 1000")
         ions_per_sim = total_ions / base_samples
         doping_increment = ions_per_sim / voxel_volume_cm3
         damage_increment_scale = ions_per_sim / voxel_volume_cm3
@@ -14674,24 +14896,54 @@ class ProcessModel:
         z1 = float(species_data["atomic_number"])
         mass1 = float(species_data["mass_amu"])
         stopping_prefactor = float(species_data["stopping_prefactor"])
-        channel_axes = CRYSTAL_CHANNEL_AXES.copy()
-        channel_axes /= np.linalg.norm(channel_axes, axis=1, keepdims=True)
         nx, ny, nz = self.grid.shape
-
-        for _ in range(base_samples):
+        stop_positions: List[Tuple[float, float, float]] = []
+        stop_materials: List[int] = []
+        self.mc_last_stops = np.zeros(self.grid.shape, dtype=np.float32)
+        species_sym = _canonical_species_symbol(species)
+        is_dopant = species_sym in {"B", "BF2", "P", "AS", "SB", "GA", "IN", "AL"}
+        # A fixed sampling seed allows sample-count and method comparisons.
+        # 'channeling' is an educational approximation, NOT lattice-resolved BCA.
+        use_heuristic_channeling = bool(mc_channeling)
+        stats = {k: 0 for k in (
+            "stopped_semiconductor", "stopped_other", "backscattered",
+            "escaped_side", "escaped_bottom", "escaped_top", "incomplete",
+        )}
+        stop_depths_nm: List[float] = []
+        stop_lateral_nm: List[float] = []
+        collision_total = 0
+        max_collisions = 2048
+        max_segments = 12000
+        boundary_epsilon_nm = max(1e-7, voxel_nm * 1e-7)
+        domain_nm = np.array([nx, ny, nz], dtype=np.float64) * voxel_nm
+        # Material properties are reused rather than reconstructed at every voxel.
+        target_cache = {}
+        for mid, mat in self.material_db.items():
+            if not mid:
+                continue
+            target = _target_params(mat)
+            target_mass = float(target["mass_amu"])
+            density = float(mat.density) / max(target_mass, 1e-12) * AVOGADRO_CM3
+            target_cache[int(mid)] = (
+                float(target["atomic_number"]), target_mass,
+                float(target["displacement_e_ev"]), density,
+                str(getattr(mat, "surface_group", "")).lower() == "semiconductor",
+            )
+        # The cumulative collision optical depth is retained across materials;
+        # this avoids spurious collisions at every thin-film interface.
+        for _sample in range(base_samples):
             coord_idx = rng.integers(0, available_coords.shape[0])
             x, y = available_coords[coord_idx]
             height = int(self.height_map[x, y])
             if height <= 0:
+                stats["incomplete"] += 1
                 continue
-            pos_nm = np.array(
-                [
-                    (x + 0.5) * voxel_nm,
-                    (y + 0.5) * voxel_nm,
-                    (height - 0.25) * voxel_nm,
-                ],
-                dtype=np.float64,
-            )
+            pos_nm = np.array([
+                (float(x) + rng.random()) * voxel_nm,
+                (float(y) + rng.random()) * voxel_nm,
+                (height - 0.25) * voxel_nm,
+            ], dtype=np.float64)
+            entry_nm = pos_nm.copy()
             if method_key == "plasma":
                 random_dir = rng.normal(size=3)
                 random_dir[2] = -abs(random_dir[2])
@@ -14699,116 +14951,251 @@ class ProcessModel:
             else:
                 spread_rad = math.radians(clamp(0.35 + 0.05 * abs(tilt_deg), 0.05, 2.0))
                 direction = _random_unit_vector_within_cone(base_direction, spread_rad, rng)
-
-            energy_eV = energy_eV_init
-            last_valid_idx: Optional[Tuple[int, int, int]] = None
-            for _ in range(2048):
-                ix = int(pos_nm[0] / voxel_nm)
-                iy = int(pos_nm[1] / voxel_nm)
-                iz = int(pos_nm[2] / voxel_nm)
-                if not (0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz):
+            energy_eV = float(energy_eV_init)
+            # Independent collision-process exponential waiting depth.
+            optical_remaining = -math.log(max(rng.random(), 1e-12))
+            collisions = 0
+            outcome = None
+            stop_idx = None
+            stop_mat = 0
+            for _segment in range(max_segments):
+                if not np.all(np.isfinite(pos_nm)) or not np.all(np.isfinite(direction)):
+                    outcome = "incomplete"
                     break
+                if np.any(pos_nm < 0.0) or np.any(pos_nm >= domain_nm):
+                    if pos_nm[2] >= domain_nm[2]:
+                        outcome = "escaped_top"
+                    elif pos_nm[2] < 0.0:
+                        outcome = "escaped_bottom"
+                    else:
+                        outcome = "escaped_side"
+                    # A particle exiting the upper surface after traveling in
+                    # the material is a backscattered or re-emitted projectile.
+                    if outcome == "escaped_top":
+                        outcome = "backscattered"
+                    break
+                ijk = np.floor(pos_nm / voxel_nm).astype(np.intp)
+                ix, iy, iz = (int(ijk[0]), int(ijk[1]), int(ijk[2]))
                 mat_id = int(self.grid[ix, iy, iz])
+                if energy_eV <= ION_ENERGY_CUTOFF_EV:
+                    if mat_id > 0:
+                        outcome = "stopped_semiconductor" if target_cache[mat_id][4] else "stopped_other"
+                        stop_idx = (ix, iy, iz)
+                        stop_mat = mat_id
+                    else:
+                        outcome = "incomplete"  # Ion did not stop inside a solid.
+                    break
+                # DDA distance to first voxel face in ray direction.
+                dist_face = math.inf
+                for axis in range(3):
+                    velocity = float(direction[axis])
+                    if velocity > 1e-14:
+                        face = (int(ijk[axis]) + 1) * voxel_nm
+                    elif velocity < -1e-14:
+                        face = int(ijk[axis]) * voxel_nm
+                    else:
+                        continue
+                    distance = (face - pos_nm[axis]) / velocity
+                    if distance >= -boundary_epsilon_nm:
+                        dist_face = min(dist_face, max(distance, 0.0))
+                if not math.isfinite(dist_face):
+                    outcome = "incomplete"
+                    break
                 if mat_id == 0:
-                    # Ballistic transport through voids (no collisions / energy loss).
-                    pos_nm = pos_nm + direction * float(2.0 * voxel_nm)
+                    # Collisionless void: move to the neighbouring cell; an
+                    # escaped ion is NOT artificially implanted at a previous stop.
+                    pos_nm += direction * (dist_face + boundary_epsilon_nm)
                     continue
-                last_valid_idx = (ix, iy, iz)
-                material = self.material_db.material(mat_id)
-                target_data = _target_params(material)
-                z2 = float(target_data["atomic_number"])
-                mass2 = float(target_data["mass_amu"])
-                displacement_e = float(target_data["displacement_e_ev"])
-                atomic_density_cm3 = 0.0
-                if mass2 > 0.0:
-                    atomic_density_cm3 = material.density / mass2 * AVOGADRO_CM3
+                z2, mass2, displacement_e, atomic_density_cm3, semiconductor = target_cache[mat_id]
                 screening_nm = _screening_length_nm(z1, z2)
                 sigma_nm2 = _nuclear_cross_section_nm2(z1, z2, energy_eV, screening_nm)
-                sigma_cm2 = sigma_nm2 * 1e-14
-                if atomic_density_cm3 <= 1e-6 or sigma_cm2 <= 0.0:
-                    break
-
-                base_mean_free_path_nm = 1e7 / max(atomic_density_cm3 * sigma_cm2, 1e-18)
-                channel_alignment = float(np.max(np.abs(channel_axes @ direction)))
-                channel_boost = 1.0 + 3.0 * (channel_alignment ** 4)
-                damage_level = float(
-                    self.damage_concentration[ix, iy, iz] / max(DAMAGE_AMORPHIZATION_THRESHOLD, 1e-9)
-                )
-                damage_factor = 1.0 + 4.0 * np.clip(damage_level, 0.0, 10.0)
-                mean_free_path_nm = np.clip(base_mean_free_path_nm * channel_boost / damage_factor, 0.2, 800.0)
-                free_path_nm = -mean_free_path_nm * math.log(max(1e-6, 1.0 - rng.random()))
-                free_path_nm = np.clip(free_path_nm, 0.05, 5.0 * mean_free_path_nm)
-
-                dE_electronic = _electron_stopping_ev_per_nm(
+                collision_rate_nm = atomic_density_cm3 * sigma_nm2 * 1e-21
+                if use_heuristic_channeling:
+                    alignment = max(abs(float(direction[2])), abs(float(direction[0])), abs(float(direction[1])))
+                    collision_rate_nm /= (1.0 + 3.0 * alignment ** 4)
+                # Limit the upper numerical rate, rather than forcing a minimum
+                # flight distance that would depend on the voxel resolution.
+                collision_rate_nm = float(np.clip(collision_rate_nm, 0.0, 20.0))
+                distance_collision = (optical_remaining / collision_rate_nm
+                                      if collision_rate_nm > 1e-20 else math.inf)
+                distance = min(dist_face, distance_collision)
+                # Electronic stopping is integrated along the actual travelled
+                # segment in the material; split at every voxel/material face.
+                stopping_ev_nm = mc_electronic_stopping_multiplier * _electron_stopping_ev_per_nm(
                     stopping_prefactor, z1, z2, energy_eV
-                ) * free_path_nm
-                energy_eV = max(energy_eV - dE_electronic, 0.0)
-                if energy_eV <= ION_ENERGY_CUTOFF_EV:
-                    break
-
-                impact_param_nm = math.sqrt(max(rng.random(), 1e-12)) * math.sqrt(max(sigma_nm2 / math.pi, 1e-6))
-                theta = 2.0 * math.atan(
-                    (COULOMB_COEFF_EV_NM * z1 * z2)
-                    / (2.0 * max(energy_eV, 1.0) * (impact_param_nm + screening_nm))
                 )
-                theta = np.clip(theta, 0.0, math.pi)
-                sin_half = math.sin(theta / 2.0)
-                energy_transfer = (
-                    energy_eV
-                    * (4.0 * mass1 * mass2)
-                    / ((mass1 + mass2) ** 2 + 1e-24)
-                    * sin_half
-                    * sin_half
-                )
-                defects = _kinchin_pease_defects(energy_transfer, displacement_e)
-                if defects > 0.0:
-                    defect_density = defects * damage_increment_scale
-                    damage_val = float(self.damage_concentration[ix, iy, iz] + defect_density)
-                    self.damage_concentration[ix, iy, iz] = float(min(damage_val, 1.0e23))
-                    new_i = float(self.interstitials[ix, iy, iz] + defect_density)
-                    new_v = float(self.vacancies[ix, iy, iz] + defect_density)
-                    self.interstitials[ix, iy, iz] = float(min(new_i, 5.0e22))
-                    self.vacancies[ix, iy, iz] = float(min(new_v, 5.0e22))
-                    try:
-                        if getattr(self, "defects_interstitial", None) is not self.interstitials and getattr(self, "defects_interstitial", None) is not None:
-                            self.defects_interstitial[ix, iy, iz] = float(
-                                min(self.defects_interstitial[ix, iy, iz] + defect_density, 5.0e22)
-                            )
-                        if getattr(self, "defects_vacancy", None) is not self.vacancies and getattr(self, "defects_vacancy", None) is not None:
-                            self.defects_vacancy[ix, iy, iz] = float(min(self.defects_vacancy[ix, iy, iz] + defect_density, 5.0e22))
-                    except Exception:
-                        pass
-                energy_eV = max(energy_eV - energy_transfer, 0.0)
-
-                travel_dir = direction
-                perp = rng.normal(size=3)
-                perp -= perp.dot(travel_dir) * travel_dir
-                if np.linalg.norm(perp) < 1e-6:
-                    perp = np.cross(travel_dir, np.array([0.0, 1.0, 0.0]))
-                perp /= np.linalg.norm(perp)
-                new_dir = travel_dir * math.cos(theta) + perp * math.sin(theta)
-                new_dir /= np.linalg.norm(new_dir)
-                jitter = rng.normal(scale=0.02, size=3)
-                new_dir += jitter * damage_factor * 0.02
-                new_dir[2] = min(new_dir[2], -1e-4)
-                direction = new_dir / np.linalg.norm(new_dir)
-
-                pos_nm = pos_nm + travel_dir * free_path_nm
-                if energy_eV <= ION_ENERGY_CUTOFF_EV:
+                distance_to_stop = (max(energy_eV - ION_ENERGY_CUTOFF_EV, 0.0) /
+                                    max(stopping_ev_nm, 1e-12))
+                if distance_to_stop <= distance:
+                    pos_nm += direction * distance_to_stop
+                    energy_eV = ION_ENERGY_CUTOFF_EV
+                    outcome = "stopped_semiconductor" if semiconductor else "stopped_other"
+                    # A stop can occur on a voxel face due to floating point error.
+                    stop_idx, stop_mat = (ix, iy, iz), mat_id
                     break
-
-            if last_valid_idx is not None:
-                ix, iy, iz = last_valid_idx
-                self.doping[ix, iy, iz] += float(doping_increment)
-                self.active_dopants[ix, iy, iz] += float(doping_increment)
-                try:
-                    species_sym = _canonical_species_symbol(species)
-                    dopant_species = {"B", "BF2", "P", "AS", "SB", "GA", "IN", "AL"}
-                    if species_sym in dopant_species:
-                        elem = self._dopant_element_symbol(species_sym)
-                        self._ensure_dopant_species_field(elem)[ix, iy, iz] += float(doping_increment)
-                except Exception:
-                    pass
+                pos_nm += direction * distance
+                energy_eV -= stopping_ev_nm * distance
+                optical_remaining -= collision_rate_nm * distance
+                if distance_collision <= dist_face + 1e-10:
+                    # Collision takes place here, *after* traversing the flight.
+                    collision_total += 1
+                    collisions += 1
+                    if collisions >= max_collisions:
+                        outcome = "incomplete"
+                        break
+                    impact_nm = math.sqrt(max(rng.random(), 1e-12) * sigma_nm2 / math.pi)
+                    # Approximate screened Rutherford CM angle; energy transfer
+                    # and projectile LAB deflection use consistent two-body kinematics.
+                    theta_cm = 2.0 * math.atan2(
+                        COULOMB_COEFF_EV_NM * z1 * z2,
+                        2.0 * max(energy_eV, 1.0) * (impact_nm + screening_nm),
+                    )
+                    theta_cm = min(theta_cm, math.pi)
+                    transfer = energy_eV * (4.0 * mass1 * mass2 / (mass1 + mass2)**2) * math.sin(theta_cm / 2.0)**2
+                    transfer = min(max(transfer, 0.0), energy_eV)
+                    defects = _kinchin_pease_defects(transfer, displacement_e)
+                    if defects > 0.0:
+                        delta_defects = defects * damage_increment_scale
+                        self.damage_concentration[ix, iy, iz] = min(float(self.damage_concentration[ix, iy, iz]) + delta_defects, 1e23)
+                        self.interstitials[ix, iy, iz] = min(float(self.interstitials[ix, iy, iz]) + delta_defects, 5e22)
+                        self.vacancies[ix, iy, iz] = min(float(self.vacancies[ix, iy, iz]) + delta_defects, 5e22)
+                        if getattr(self, "defects_interstitial", None) is not self.interstitials:
+                            self.defects_interstitial[ix, iy, iz] = min(float(self.defects_interstitial[ix, iy, iz]) + delta_defects, 5e22)
+                        if getattr(self, "defects_vacancy", None) is not self.vacancies:
+                            self.defects_vacancy[ix, iy, iz] = min(float(self.defects_vacancy[ix, iy, iz]) + delta_defects, 5e22)
+                    energy_eV -= transfer
+                    theta_lab = math.atan2(
+                        mass2 * math.sin(theta_cm),
+                        mass1 + mass2 * math.cos(theta_cm),
+                    )
+                    sideways = rng.normal(size=3)
+                    sideways -= np.dot(sideways, direction) * direction
+                    norm = np.linalg.norm(sideways)
+                    if norm < 1e-12:
+                        sideways = np.cross(direction, np.array([1.0, 0.0, 0.0]))
+                        norm = np.linalg.norm(sideways)
+                    sideways /= max(norm, 1e-12)
+                    direction = direction * math.cos(theta_lab) + sideways * math.sin(theta_lab)
+                    direction /= np.linalg.norm(direction)
+                    optical_remaining = -math.log(max(rng.random(), 1e-12))
+                    # Slight offset avoids ambiguously remaining on a voxel face.
+                    pos_nm += direction * boundary_epsilon_nm
+                else:
+                    pos_nm += direction * boundary_epsilon_nm
+            if outcome is None:
+                outcome = "incomplete"
+            stats[outcome] += 1
+            if outcome == "stopped_semiconductor" and is_dopant and stop_idx is not None:
+                ix, iy, iz = stop_idx
+                coords = (pos_nm / voxel_nm) - 0.5
+                coords = np.clip(coords, (0, 0, 0), np.asarray(self.grid.shape, dtype=float)-1)
+                # Use the actual stopping-material voxel when floating-point
+                # boundary rounding would put the particle outside the solid.
+                probe = np.floor(pos_nm / voxel_nm).astype(np.intp)
+                if (np.any(probe < 0) or np.any(probe >= self.grid.shape)
+                        or int(self.grid[tuple(probe)]) != stop_mat):
+                    coords = np.array(stop_idx, dtype=np.float64)
+                stop_positions.append(tuple(float(v) for v in coords))
+                stop_materials.append(int(stop_mat))
+                self.mc_last_stops[ix, iy, iz] += float(doping_increment)
+                stop_depths_nm.append(float(entry_nm[2] - pos_nm[2]))
+                stop_lateral_nm.append(float(np.linalg.norm((pos_nm - entry_nm)[:2])))
+        self.mc_last_stats = dict(stats)
+        self.mc_last_stats.update({
+            "incident_trajectories": base_samples,
+            "electronic_stopping_multiplier": mc_electronic_stopping_multiplier,
+            "heuristic_channeling": use_heuristic_channeling,
+            "collisions": collision_total,
+            "retained_fraction": len(stop_positions) / base_samples,
+            "incident_dose_cm2": float(dose_cm2),
+            "retained_dose_cm2": float(dose_cm2) * len(stop_positions) / base_samples,
+            "mean_projected_range_nm": float(np.mean(stop_depths_nm)) if stop_depths_nm else None,
+            "depth_straggle_nm": float(np.std(stop_depths_nm)) if stop_depths_nm else None,
+            "mean_lateral_displacement_nm": float(np.mean(stop_lateral_nm)) if stop_lateral_nm else None,
+            "lateral_straggle_nm": float(np.std(stop_lateral_nm)) if stop_lateral_nm else None,
+        })
+        # Always report the benchmark scale, but do not tune the physical model
+        # without an independently checked stopping database.
+        si_reference = _mc_si_reference(species, energy_kev)
+        if si_reference is not None:
+            self.mc_last_stats["flat_si_reference_rp_nm"] = si_reference[0]
+            self.mc_last_stats["flat_si_reference_straggle_nm"] = si_reference[1]
+            if stop_depths_nm:
+                self.mc_last_stats["range_over_reference"] = float(np.mean(stop_depths_nm)) / si_reference[0]
+            self.mc_last_stats["reference_note"] = (
+                "Approximate flat-Si LSS reference; only compare on flat, uncovered Si with wide boundaries"
+            )
+        self._log("MC BCA outcomes " + str(self.mc_last_stats))
+        ratio = self.mc_last_stats.get("range_over_reference")
+        if ratio is not None and (ratio > 1.5 or ratio < 0.67):
+            self._log("WARNING: BCA mean range deviates strongly from approximate flat-Si reference "
+                      "(only diagnostic for flat silicon; complex masks invalidate the direct comparison).")
+        if stop_positions and is_dopant:
+            points = np.asarray(stop_positions, dtype=np.float64)
+            mats = np.asarray(stop_materials, dtype=np.uint16)
+            # The raw distribution is kept separate from the state used in processing.
+            # Nearest and CIC both conserve every accepted trajectory's weight,
+            # including at surfaces and material boundaries.
+            added = np.zeros(self.grid.shape, dtype=np.float32)
+            if mc_deposition == "nearest":
+                inds = np.clip(np.rint(points).astype(np.intp), [0, 0, 0], np.array(self.grid.shape) - 1)
+                # If the final continuous position lies beyond a boundary, deposit
+                # into its recorded final solid voxel instead.
+                invalid = self.grid[inds[:, 0], inds[:, 1], inds[:, 2]] != mats
+                if np.any(invalid):
+                    final_vox = np.clip(np.floor(points[invalid] + 0.5).astype(np.intp), [0, 0, 0], np.array(self.grid.shape) - 1)
+                    inds[invalid] = final_vox
+                np.add.at(added, (inds[:, 0], inds[:, 1], inds[:, 2]), np.float32(doping_increment))
+            else:
+                low = np.floor(points).astype(np.intp)
+                fract = np.clip(points - low, 0.0, 1.0)
+                # First pass: determine the valid CIC weight per ion. Do not let
+                # dopants leak across a different material or into a void.
+                normalized = np.zeros(len(points), dtype=np.float64)
+                shape = np.array(self.grid.shape, dtype=np.intp)
+                for bx in (0, 1):
+                    for by in (0, 1):
+                        for bz in (0, 1):
+                            offset = np.array([bx, by, bz], dtype=np.intp)
+                            ijk = low + offset
+                            valid = np.all((ijk >= 0) & (ijk < shape), axis=1)
+                            safe = np.clip(ijk, [0, 0, 0], shape - 1)
+                            valid &= (self.grid[safe[:, 0], safe[:, 1], safe[:, 2]] == mats)
+                            w = ((fract[:, 0] if bx else 1.0 - fract[:, 0]) *
+                                 (fract[:, 1] if by else 1.0 - fract[:, 1]) *
+                                 (fract[:, 2] if bz else 1.0 - fract[:, 2]))
+                            normalized += np.where(valid, w, 0.0)
+                for bx in (0, 1):
+                    for by in (0, 1):
+                        for bz in (0, 1):
+                            offset = np.array([bx, by, bz], dtype=np.intp)
+                            ijk = low + offset
+                            valid = np.all((ijk >= 0) & (ijk < shape), axis=1)
+                            safe = np.clip(ijk, [0, 0, 0], shape - 1)
+                            valid &= (self.grid[safe[:, 0], safe[:, 1], safe[:, 2]] == mats)
+                            w = ((fract[:, 0] if bx else 1.0 - fract[:, 0]) *
+                                 (fract[:, 1] if by else 1.0 - fract[:, 1]) *
+                                 (fract[:, 2] if bz else 1.0 - fract[:, 2]))
+                            valid &= normalized > 1e-15
+                            if np.any(valid):
+                                ids = safe[valid]
+                                np.add.at(added, (ids[:, 0], ids[:, 1], ids[:, 2]),
+                                          (doping_increment * w[valid] / normalized[valid]).astype(np.float32))
+                # Extremely rare case: no valid CIC neighbours (a particle stopped
+                # at the model boundary). Deposit in the nearest *recorded solid*.
+                missing = normalized <= 1e-15
+                if np.any(missing):
+                    near = np.clip(np.floor(points[missing] + 0.5).astype(np.intp), [0, 0, 0], shape - 1)
+                    np.add.at(added, (near[:, 0], near[:, 1], near[:, 2]), np.float32(doping_increment))
+            before = float(added.astype(np.float64).sum())
+            if mc_smoothing_nm > 0.0:
+                added = _mc_gaussian_smooth_material_aware(added, self.grid, mc_smoothing_nm / voxel_nm)
+            after = float(added.astype(np.float64).sum())
+            self.doping += added
+            self.active_dopants += added
+            self._ensure_dopant_species_field(self._dopant_element_symbol(species_sym))[:] += added
+            self._log("MC dose accounting: accepted={}/{} expected={:.6g} sum_before={:.6g} sum_after={:.6g} (cm^-3 voxel-sum)".format(
+                len(points), base_samples, len(points) * doping_increment, before, after))
 
         self.last_implant_species = _canonical_species_symbol(species)
         self._log(
@@ -14826,6 +15213,7 @@ class ProcessModel:
         time_s: float,
         ambient: str,
         ramp_rate_c_s: float,
+        ted_mode: str = "intrinsic",
     ) -> None:
         if time_s <= 0.0:
             return
@@ -14882,7 +15270,18 @@ class ProcessModel:
         dx_nm = float(max(self.voxel_size_nm, 1.0))
         reactivation_coeff = 1.8e-4 * math.exp(-1.9 / max(k_b * temperature_k, 1e-6))
 
-        # Work on a tight ROI around dopants/defects for speed on large domains.
+        # Include a diffusion-distance-dependent halo around the source field.
+        # A fixed three-voxel ROI previously imposed an artificial rectangular
+        # reflecting boundary around an implantation window.
+        ted_enabled = str(ted_mode).strip().lower() in {"local", "local_ted", "bounded", "on"}
+        ted_max_factor = 4.0  # Phenomenological bound, NOT a calibrated TED model.
+        longest_dopant_sigma_nm = math.sqrt(
+            max(2.0 * D_nm2_s_si * effective_time_s * (ted_max_factor if ted_enabled else 1.0), 0.0)
+        )
+        roi_margin = min(
+            max(nx, ny, nz),
+            max(4, int(math.ceil(6.0 * math.sqrt(3.0) * longest_dopant_sigma_nm / dx_nm)) + 4),
+        )
         roi_mask = (
             (self.doping > 0)
             | (self.cluster_bic > 0)
@@ -14891,7 +15290,7 @@ class ProcessModel:
             | (self.interstitials > 0)
             | (self.vacancies > 0)
         )
-        roi = _mask_bbox_slices(roi_mask, margin=3) if np.any(roi_mask) else None
+        roi = _mask_bbox_slices(roi_mask, margin=roi_margin) if np.any(roi_mask) else None
         ambient_key = ambient.lower()
         if ambient_key in {"o2", "h2o", "dryox", "steam"}:
             self._grow_oxide_from_silicon(temperature_c, time_s, ambient_key)
@@ -14925,10 +15324,24 @@ class ProcessModel:
         V_field = self.vacancies[roi].astype(np.float64, copy=True)
         cluster_I = self.cluster_interstitial[roi].astype(np.float64, copy=True)
 
-        if np.any(self.damage_concentration[roi]):
-            damage = self.damage_concentration[roi].astype(np.float64, copy=False)
-            I_field = I_field + 0.6 * damage
-            V_field = V_field + 0.3 * damage
+        # Implantation already deposits interstitials and vacancies alongside
+        # the damage proxy.  Do NOT add the stored damage field to I/V here:
+        # doing so injects the same defects again on every anneal call.
+        # Temperature-activated damage recovery is handled separately below.
+        damage_before = np.clip(
+            self.damage_concentration[roi].astype(np.float64, copy=True), 0.0, None
+        )
+        # Phenomenological first-order healing rate, *not* a calibrated Si
+        # defect-kinetics law.  Edit these two constants to tune the model.
+        DAMAGE_RECOVERY_K0_S = 3.0e3      # attempt frequency, s^-1
+        DAMAGE_RECOVERY_EA_EV = 1.50     # activation energy, eV
+        damage_rate_s = DAMAGE_RECOVERY_K0_S * math.exp(
+            -DAMAGE_RECOVERY_EA_EV / max(k_b * temperature_k, 1.0e-12)
+        )
+        # Effective time follows the anneal() convention for the ramp.  Keep
+        # the exponential in float64 to avoid accumulated step-size error.
+        damage_survival = math.exp(-min(damage_rate_s * effective_time_s, 700.0))
+        damage_after = np.where(solid_w, damage_before * damage_survival, 0.0)
 
         if self._pending_interstitial_injection is not None:
             inj = self._pending_interstitial_injection.astype(np.float64, copy=False)
@@ -15021,25 +15434,122 @@ class ProcessModel:
                 name = "Silicon"
             scale_by_mid[int(mid)] = float(np.clip(material_diff_scale.get(name, 1.0), 1.0e-7, 25.0))
 
-        def _weighted_diffuse(field: np.ndarray, weights: np.ndarray, sigma_vox: float) -> np.ndarray:
-            if sigma_vox <= 0.25 or not np.any(field):
-                return field
+        def _weighted_diffuse(
+            field: np.ndarray, weights: np.ndarray, sigma_vox: float, conserve: bool = False
+        ) -> np.ndarray:
+            """Smooth within material mask without duplicating concentrations.
+
+            For sigma < 0.25, a previous version returned the *entire* field
+            for EACH material. Summing these arrays multiplied the dopant by
+            the number of materials once per anneal time step.
+            """
+            valid = weights > 0.0
+            masked = np.where(valid, field, 0.0)
+            if not np.any(masked) or sigma_vox <= 0.25:
+                return masked
             if _scipy_ndimage is None:
-                mean_val = float(field[weights > 0.0].mean()) if np.any(weights > 0.0) else float(field.mean())
+                # Do not homogenize/dilute using values from other materials.
+                mean_val = float(np.mean(masked[valid]))
                 mix = float(np.clip(sigma_vox / 16.0, 0.0, 1.0))
-                return (1.0 - mix) * field + mix * mean_val
-            sigma_vox = float(sigma_vox)
-            if sigma_vox > 28.0:
-                mean_val = float(field[weights > 0.0].mean()) if np.any(weights > 0.0) else float(field.mean())
-                mix = float(np.clip((sigma_vox - 28.0) / 20.0, 0.0, 1.0))
-                field = (1.0 - mix) * field + mix * mean_val
-                sigma_vox = 28.0
-            numer = _scipy_ndimage.gaussian_filter(field * weights, sigma=sigma_vox, mode="constant", cval=0.0)
-            denom = _scipy_ndimage.gaussian_filter(weights, sigma=sigma_vox, mode="constant", cval=0.0)
-            out = np.zeros_like(field)
-            good = denom > 1e-9
-            out[good] = numer[good] / denom[good]
+                out = np.where(valid, (1.0 - mix) * masked + mix * mean_val, 0.0)
+            else:
+                sigma_vox = float(sigma_vox)
+                if sigma_vox > 28.0:
+                    mean_val = float(np.mean(masked[valid]))
+                    mix = float(np.clip((sigma_vox - 28.0) / 20.0, 0.0, 1.0))
+                    masked = np.where(valid, (1.0 - mix) * masked + mix * mean_val, 0.0)
+                    sigma_vox = 28.0
+                numer = _scipy_ndimage.gaussian_filter(
+                    masked, sigma=sigma_vox, mode="constant", cval=0.0
+                )
+                denom = _scipy_ndimage.gaussian_filter(
+                    weights, sigma=sigma_vox, mode="constant", cval=0.0
+                )
+                out = np.zeros_like(field)
+                good = valid & (denom > 1e-9)
+                out[good] = numer[good] / denom[good]
+            if conserve:
+                # Dopant diffusion conserves atoms; the normalised convolution
+                # alone does not generally conserve a field's integral.
+                before = float(np.sum(masked[valid], dtype=np.float64))
+                after = float(np.sum(out[valid], dtype=np.float64))
+                if before > 0.0 and after > 0.0:
+                    out *= before / after
             return out
+
+        def _diffuse_dopants_local(
+            field: np.ndarray, diffusivity_nm2_s: np.ndarray, timestep_s: float
+        ) -> np.ndarray:
+            """Conservative explicit finite-volume diffusion on the voxel grid.
+
+            Same-material face fluxes only (zero flux across air/SiO2/metal
+            boundaries). Each face transfers exactly equal and opposite dopant
+            amounts, so rectangular ROI edges cannot create or destroy dose.
+            Substeps enforce the explicit 3D stability criterion. Diffusion
+            lengths below a voxel are represented by small neighbour transfers.
+            """
+            if timestep_s <= 0.0 or not np.any(diffusivity_nm2_s > 0):
+                return np.clip(field, 0.0, None)
+            inv_dx2 = 1.0 / (dx_nm * dx_nm)
+            courant = float(np.max(diffusivity_nm2_s)) * timestep_s * inv_dx2
+            n_sub = max(1, int(math.ceil(6.0 * courant / 0.45)))
+            # A very large number of substeps is preferable to silently
+            # altering the diffusivity, but is flagged in the anneal log.
+            sub_dt = timestep_s / n_sub
+            result = np.clip(field, 0.0, None).astype(np.float64, copy=True)
+            for _sub in range(n_sub):
+                for ax in range(3):
+                    sl_a = [slice(None)] * 3
+                    sl_b = [slice(None)] * 3
+                    sl_a[ax] = slice(None, -1)
+                    sl_b[ax] = slice(1, None)
+                    a, b = tuple(sl_a), tuple(sl_b)
+                    d_a = diffusivity_nm2_s[a]
+                    d_b = diffusivity_nm2_s[b]
+                    # Harmonic mean makes the face conductance vanish if
+                    # either side is impermeable. A strict material-ID check
+                    # additionally prevents undesired cross-material mixing.
+                    face_d = np.zeros_like(d_a, dtype=np.float64)
+                    good = (d_a > 0.0) & (d_b > 0.0) & (grid_roi[a] == grid_roi[b])
+                    np.divide(2.0 * d_a * d_b, d_a + d_b,
+                              out=face_d, where=good)
+                    flux = (sub_dt * inv_dx2) * face_d * (result[b] - result[a])
+                    # Calculate the full face flux first, then apply equal
+                    # and opposite transfers.  This conserves concentration
+                    # without allocating a full-volume update buffer.
+                    result[a] += flux
+                    result[b] -= flux
+                # The stable scheme is positivity-preserving to floating error.
+                result = np.maximum(result, 0.0)
+            return result
+
+        # Constant material diffusivity baseline, applied locally by fluxes.
+        # Non-semiconductor materials are impermeable in this model; dopant
+        # already present there is preserved but cannot spread to other layers.
+        base_diffusivity = np.zeros(grid_roi.shape, dtype=np.float64)
+        for mid in solid_mat_ids:
+            if int(mid) >= len(semi_lut) or not semi_lut[int(mid)]:
+                continue
+            base_diffusivity[grid_roi == int(mid)] = (
+                D_nm2_s_si * float(scale_by_mid.get(int(mid), 1.0))
+            )
+
+        # The existing I/V fields are phenomenological and their values are
+        # not calibrated to the Arrhenius equilibrium reference concentrations.
+        # Consequently default to intrinsic diffusion; optional bounded TED
+        # uses the LOCAL point-defect fields and explicit saturation scales,
+        # never a percentile-derived global enhancement factor.
+        ted_defect_scale_cm3 = 1.0e18  # Experimental/illustrative parameter.
+        def _local_dopant_diffusivity() -> np.ndarray:
+            if not ted_enabled:
+                return base_diffusivity
+            local_I = np.maximum(I_field, 0.0)
+            local_V = np.maximum(V_field, 0.0)
+            factor = (1.0
+                      + alpha_I * (local_I / (local_I + ted_defect_scale_cm3))
+                      + alpha_V * (local_V / (local_V + ted_defect_scale_cm3)))
+            factor = np.clip(factor, 1.0, ted_max_factor)
+            return base_diffusivity * factor
 
         # Hard cap to keep dopant/defect fields numerically stable in float32 storage.
         # This also prevents runaway LLM-proposed implant doses from producing INF/NaN.
@@ -15097,72 +15607,17 @@ class ProcessModel:
                 I_field = _weighted_diffuse(I_field, solid_weights, sigma_I)
                 V_field = _weighted_diffuse(V_field, solid_weights, sigma_V)
 
-            I_ratio = I_field / max(I_eq, 1e-12)
-            V_ratio = V_field / max(V_eq, 1e-12)
-            mask = (semi_weights > 0.0) & (active > 0.0)
-            if np.any(mask):
-                I_stat = float(np.percentile(I_ratio[mask], 70))
-                V_stat = float(np.percentile(V_ratio[mask], 70))
-            else:
-                I_stat = float(np.mean(I_ratio)) if I_ratio.size else 1.0
-                V_stat = float(np.mean(V_ratio)) if V_ratio.size else 1.0
-            enh_I = math.sqrt(max(I_stat, 0.0))
-            enh_V = math.sqrt(max(V_stat, 0.0))
-            enh_I = float(np.clip(enh_I, 0.0, 250.0))
-            enh_V = float(np.clip(enh_V, 0.0, 250.0))
-            enh_factor = float(1.0 + alpha_I * enh_I + alpha_V * enh_V)
-            enh_factor = float(np.clip(enh_factor, 0.0, 250.0))
+            if fut_I is not None:
+                I_field = fut_I.result()
+                V_field = fut_V.result()
+                fut_I = None
+                fut_V = None
 
-            # Material-aware dopant diffusion (Arrhenius vs. T with per-material scaling).
-            active0 = active
-            if solid_mat_ids and solid_weights_by_mid:
-                active_next = np.zeros_like(active0)
-                futures: List[Any] = []
-                if self.max_workers > 1 and _scipy_ndimage is not None and len(solid_mat_ids) >= 2:
-                    for mid in solid_mat_ids:
-                        w_mid = solid_weights_by_mid.get(mid)
-                        if w_mid is None:
-                            continue
-                        D_eff = float(D_nm2_s_si) * float(scale_by_mid.get(mid, 1.0)) * enh_factor
-                        D_eff = float(np.clip(D_eff, 0.0, 5.0e4))
-                        sigma_dop = math.sqrt(max(2.0 * D_eff * dt, 0.0)) / max(dx_nm, 1e-9)
-                        sigma_dop = float(np.clip(sigma_dop, 0.0, 20.0))
-                        futures.append(self.parallel.submit(_weighted_diffuse, active0, w_mid, sigma_dop))
-                    for out in futures:
-                        try:
-                            active_next += out.result()
-                        except Exception:
-                            continue
-                else:
-                    for mid in solid_mat_ids:
-                        w_mid = solid_weights_by_mid.get(mid)
-                        if w_mid is None:
-                            continue
-                        D_eff = float(D_nm2_s_si) * float(scale_by_mid.get(mid, 1.0)) * enh_factor
-                        D_eff = float(np.clip(D_eff, 0.0, 5.0e4))
-                        sigma_dop = math.sqrt(max(2.0 * D_eff * dt, 0.0)) / max(dx_nm, 1e-9)
-                        sigma_dop = float(np.clip(sigma_dop, 0.0, 20.0))
-                        active_next += _weighted_diffuse(active0, w_mid, sigma_dop)
-
-                # Cross-material penetration across solid interfaces (small, temperature-activated).
-                if float(temperature_c) >= 850.0 and enh_factor > 0.0:
-                    D_eff_mix = float(D_nm2_s_si) * float(enh_factor) * 0.05
-                    D_eff_mix = float(np.clip(D_eff_mix, 0.0, 2.0e4))
-                    sigma_mix = math.sqrt(max(2.0 * D_eff_mix * dt, 0.0)) / max(dx_nm, 1e-9)
-                    sigma_mix = float(np.clip(sigma_mix, 0.0, 6.0))
-                    active_next = _weighted_diffuse(active_next, solid_weights, sigma_mix)
-                active = active_next
-                fut_active = None
-            else:
-                D_eff_scalar = float(D_nm2_s_si) * enh_factor
-                D_eff_scalar = float(np.clip(D_eff_scalar, 0.0, 5.0e4))
-                sigma_dop = math.sqrt(max(2.0 * D_eff_scalar * dt, 0.0)) / max(dx_nm, 1e-9)
-                sigma_dop = float(np.clip(sigma_dop, 0.0, 20.0))
-                if self.max_workers > 1 and _scipy_ndimage is not None:
-                    fut_active = self.parallel.submit(_weighted_diffuse, active0, solid_weights, sigma_dop)
-                else:
-                    fut_active = None
-                    active = _weighted_diffuse(active0, solid_weights, sigma_dop)
+            # Local, no-flux, dose-conserving transport.  No global TED
+            # percentile and NO generic solid-to-solid smoothing: without an
+            # explicit segregation model, Si <-> SiO2 exchange is disabled.
+            active = _diffuse_dopants_local(active, _local_dopant_diffusivity(), dt)
+            fut_active = None
 
             if fut_I is not None:
                 I_field = fut_I.result()
@@ -15202,7 +15657,9 @@ class ProcessModel:
                     if not isinstance(arr, np.ndarray) or arr.shape != self.grid.shape:
                         continue
                     items.append((sym.strip(), arr))
-                if items:
+                if len(items) == 1:
+                    items[0][1][roi] = total_after
+                elif items:
                     total_species_before = np.zeros_like(total_after, dtype=np.float32)
                     for _, arr in items:
                         try:
@@ -15222,11 +15679,15 @@ class ProcessModel:
                             frac = np.zeros_like(total_after, dtype=np.float32)
                             frac[nz_mask] = (sub[nz_mask] / denom[nz_mask]).astype(np.float32, copy=False)
                             if sigma_frac >= 0.35:
-                                frac = _weighted_diffuse(frac, solid_weights, sigma_frac).astype(np.float32, copy=False)
-                                frac = np.clip(frac, 0.0, None).astype(np.float32, copy=False)
+                                frac_new = np.zeros_like(frac)
+                                for mid in solid_mat_ids:
+                                    w_mid = solid_weights_by_mid.get(mid)
+                                    if w_mid is not None:
+                                        frac_new += _weighted_diffuse(frac, w_mid, sigma_frac)
+                                frac = np.clip(frac_new, 0.0, None).astype(np.float32, copy=False)
                             frac_sum += frac
                             frac_fields.append((sym, arr, frac))
-                        denom_frac = np.where(frac_sum > np.float32(1e-12), frac_sum, np.float32(1.0))
+                        denom_frac = np.where(frac_sum > np.float32(0.0), frac_sum, np.float32(1.0))
                         for _sym, _arr, frac in frac_fields:
                             frac_n = (frac / denom_frac).astype(np.float32, copy=False)
                             out = (total_after * frac_n).astype(np.float32, copy=False)
@@ -15260,17 +15721,26 @@ class ProcessModel:
         self.vacancies[roi] = np.clip(V_field, 0.0, None).astype(np.float32, copy=False)
         self.cluster_interstitial[roi] = np.clip(cluster_I, 0.0, None).astype(np.float32, copy=False)
         self.cluster_bic[roi] = np.clip(cluster_b, 0.0, None).astype(np.float32, copy=False)
+        # Damage is a separate implantation-disorder proxy.  Its exponential
+        # decay does not inject fresh point defects: implantation already did.
+        self.damage_concentration[roi] = np.clip(
+            damage_after, 0.0, 1.0e23
+        ).astype(np.float32, copy=False)
 
         # Avoid duplicate large arrays: keep legacy defects_* as views of the primary fields.
         self.defects_interstitial = self.interstitials
         self.defects_vacancy = self.vacancies
 
         self._log(
-            "Anneal {}°C for {:.1f}s (ambient={}) | active dose {:.2e} cm^-2".format(
+            "Anneal {}°C for {:.1f}s (ambient={}) | dopant diffusion={} | ROI halo={} vox | active dose {:.2e} cm^-2 | damage recovery {:.1f}% (k={:.3g} s^-1)".format(
                 temperature_c,
                 time_s,
                 ambient,
+                "local bounded TED" if ted_enabled else "intrinsic",
+                roi_margin,
                 float(self.active_dopants.sum() * (self.voxel_size_nm * 1e-7) ** 3 / max((self.voxel_size_nm * 1e-7) ** 2 * nx * ny, 1e-18)),
+                100.0 * (1.0 - damage_survival),
+                damage_rate_s,
             )
         )
 
@@ -15296,7 +15766,7 @@ class ProcessModel:
             "BPSG": (750.0, 1050.0, 320.0, 120.0, 0.08, 600.0),
             "PSG": (800.0, 1100.0, 260.0, 160.0, 0.06, 700.0),
             "SOD": (450.0, 800.0, 300.0, 90.0, 0.10, 500.0),
-            "Silicon Dioxide": (900.0, 1150.0, 140.0, 220.0, 0.02, 900.0),
+            # Pure SiO2 is not a flowable glass at normal anneal temperatures.
         }
 
         try:
@@ -18566,7 +19036,13 @@ class DepositionStep(ProcessStep):
             ParameterSpec("method", "Method", "enum", "CVD", choices=methods),
             ParameterSpec("coverage", "Coverage", "enum", "Full wafer", choices=coverage_modes),
             ParameterSpec("temperature", "Temperature", "float", 400.0, 0.0, 1500.0, units="°C"),
-            ParameterSpec("directionality", "Directionality", "float", 0.2, 0.0, 1.0, decimals=2),
+            ParameterSpec("directionality", "Directionality", "float", 0.2, 0.0, 1.0, decimals=2,
+                          tooltip="0 = conformal, 1 = directional. In PVD Simple mode this sets the deposition mixture directly."),
+            ParameterSpec("pvd_controls", "PVD controls", "enum", "Simple",
+                          choices=[("Simple", "Simple — directionality"), ("Advanced", "Advanced — detailed parameters")],
+                          tooltip="Only for PVD. Advanced reproduces legacy PVD physics; Simple ignores the detailed parameters."),
+            ParameterSpec("directionality_user_set", "Directionality manually set", "bool", False,
+                          tooltip="Internal recipe metadata: prevents automatic replacement of an explicitly selected directionality."),
             ParameterSpec("gap_fill_bias", "Gap-fill bias", "float", 0.0, -500.0, 1000.0, units="nm"),
             ParameterSpec("sticking", "Sticking coefficient", "float", 0.4, 0.01, 1.0, decimals=2),
             ParameterSpec("source_sigma", "Source sigma", "float", 0.6, 0.05, 1.8, decimals=2),
@@ -18574,15 +19050,15 @@ class DepositionStep(ProcessStep):
             ParameterSpec("resputter", "Resputter probability", "float", 0.02, 0.0, 0.5, decimals=3),
             ParameterSpec(
                 "dopant_element",
-                "ALD dopant element",
+                "In-situ dopant element",
                 "enum",
                 "None",
                 choices=dopant_elements,
-                tooltip="In-situ dopant incorporation for ALD films (used only when Method=ALD).",
+                tooltip="Incorporate dopant into newly grown CVD, ALD, or epitaxial material only.",
             ),
             ParameterSpec(
                 "dopant_conc",
-                "ALD dopant concentration",
+                "In-situ concentration",
                 "float",
                 0.0,
                 0.0,
@@ -18590,11 +19066,11 @@ class DepositionStep(ProcessStep):
                 units="cm^-3",
                 decimals=0,
                 step=1.0e18,
-                tooltip="Dopant concentration assigned into the top part of the deposited ALD film.",
+                tooltip="Nominal in-situ concentration (cm^-3) in newly deposited voxels only.",
             ),
             ParameterSpec(
                 "dopant_mode",
-                "ALD dopant mode",
+                "In-situ doping mode",
                 "enum",
                 "Max",
                 choices=dopant_modes,
@@ -18617,6 +19093,7 @@ class DepositionStep(ProcessStep):
             source_sigma=self.params["source_sigma"],
             surface_diff_nm=self.params["surface_diff"],
             resputter_prob=self.params["resputter"],
+            pvd_controls=self.params.get("pvd_controls", "Advanced"),
             dopant_element=dopant_element,
             dopant_concentration_cm3=self.params.get("dopant_conc", 0.0),
             dopant_mode=self.params.get("dopant_mode", "Max"),
@@ -18703,6 +19180,9 @@ class SelectiveEpitaxyStep(ProcessStep):
                 if mid is not None:
                     ids.append(int(mid))
             seed_ids = ids if ids else None
+        # Retain pre-growth occupancy to exclude substrate or earlier Si/SiGe
+        # layers, even when the newly grown material is the same material ID.
+        pre_material_mask = model.grid == np.uint16(material_id)
         model.deposit_material(
             material_name,
             self.params["thickness"],
@@ -18715,49 +19195,30 @@ class SelectiveEpitaxyStep(ProcessStep):
         )
         dopants = self.params.get("doping", "")
         if dopants:
-            self._apply_in_situ_doping(model, material_id, dopants)
+            newly_deposited = (model.grid == np.uint16(material_id)) & ~pre_material_mask
+            self._apply_in_situ_doping(model, material_id, dopants, newly_deposited)
         return f"Selective epitaxy {material_name}"
 
-    def _apply_in_situ_doping(self, model: ProcessModel, material_id: int, dopants: str) -> None:
-        entries = [token.strip() for token in dopants.split(",") if token.strip()]
-        lattice_species: Optional[str] = None
-        try:
-            model._ensure_doping_field()
-        except Exception:
-            return
-        mask = model.open_mask
-        xs, ys = np.where(mask)
-        for entry in entries:
-            if ":" not in entry:
+    def _apply_in_situ_doping(
+        self, model: ProcessModel, material_id: int, dopants: str,
+        new_voxels: np.ndarray,
+    ) -> None:
+        """Apply each dopant only to newly grown selective-epitaxy voxels."""
+        for entry in (token.strip() for token in str(dopants).split(",")):
+            if not entry or ":" not in entry:
                 continue
-            species, conc = entry.split(":", 1)
+            species, value = entry.split(":", 1)
             try:
-                conc_val = float(conc)
-            except ValueError:
+                concentration = float(value)
+            except (ValueError, TypeError):
                 continue
-            elem = model._dopant_element_symbol(species)
-            try:
-                species_field = model._ensure_dopant_species_field(elem)
-            except Exception:
-                species_field = None
-            for x, y in zip(xs, ys):
-                height = int(model.height_map[x, y])
-                if height <= 0:
-                    continue
-                z = height - 1
-                while z >= 0 and int(model.grid[x, y, z]) == material_id:
-                    existing = model.doping[x, y, z]
-                    model.doping[x, y, z] = max(existing, conc_val)
-                    if isinstance(species_field, np.ndarray):
-                        try:
-                            species_field[x, y, z] = max(float(species_field[x, y, z]), float(conc_val))
-                        except Exception:
-                            pass
-                    z -= 1
-            if not lattice_species:
-                lattice_species = species.strip().upper()
-        if lattice_species:
-            model.last_implant_species = lattice_species
+            if not np.isfinite(concentration) or concentration <= 0.0:
+                continue
+            element = model._dopant_element_symbol(species.strip())
+            n = model._apply_deposition_dopant_new_voxels(
+                new_voxels, material_id, element, concentration, "Max")
+            if n:
+                model.last_implant_species = species.strip().upper()
 
 
 class EtchStep(ProcessStep):
@@ -18846,6 +19307,34 @@ class EtchStep(ProcessStep):
             stop_on_material=stop_on,
         )
         return f"Etch {mat_name}"
+
+
+class LiftOffStep(ProcessStep):
+    name = "Lift-off"
+    group = "Lithography"
+
+    def parameter_specs(self) -> Sequence[ParameterSpec]:
+        # Explicit material choice avoids accidentally removing unrelated films.
+        film_choices = [(name, name) for name in self.material_db.names() if name not in {"Void", "Photoresist"}]
+        resist_choices = [(name, name) for name in self.material_db.names() if name != "Void"]
+        return (
+            ParameterSpec(
+                "film_material", "Deposited film to lift off", "enum", "Nickel", choices=film_choices,
+                tooltip="Removes this material above remaining photoresist, retaining it within developed openings.",
+            ),
+            ParameterSpec(
+                "resist_material", "Resist to remove", "enum", "Photoresist", choices=resist_choices,
+                tooltip="The patterned sacrificial photoresist underneath the removable metal.",
+            ),
+        )
+
+    def execute(self, model: ProcessModel) -> str:
+        film = str(self.params.get("film_material", "Nickel"))
+        resist = str(self.params.get("resist_material", "Photoresist"))
+        result = model.lift_off(film, resist)
+        return "Lift-off {}: removed {} resist and {} film voxels, retained {} film voxels".format(
+            film, result["resist_removed"], result["film_removed"], result["film_retained"]
+        )
 
 
 class CMPProcessStep(ProcessStep):
@@ -18959,6 +19448,18 @@ class ImplantationStep(ProcessStep):
             ParameterSpec("tilt", "Tilt", "float", 7.0, 0.0, 45.0, units="°"),
             ParameterSpec("rotation", "Rotation", "float", 0.0, 0.0, 360.0, units="°"),
             ParameterSpec("method", "Method", "enum", "Beam", choices=method_choices),
+            ParameterSpec("mc_trajectories", "MC trajectories (independent of dose)", "enum", "5000",
+                          choices=[("2000", "2,000 (fast)"), ("5000", "5,000 (default)"),
+                                   ("10000", "10,000"), ("20000", "20,000"), ("50000", "50,000 (slow)")]),
+            ParameterSpec("mc_deposition", "MC particle deposition", "enum", "cic",
+                          choices=[("cic", "Trilinear / cloud-in-cell"), ("nearest", "Nearest voxel (raw)")]),
+            ParameterSpec("mc_smoothing_nm", "MC spatial averaging", "enum", "0",
+                          choices=[("0", "Off (raw spatial result)"), ("5", "5 nm"),
+                                   ("10", "10 nm"), ("20", "20 nm")]),
+            ParameterSpec("mc_channeling", "MC heuristic channeling (experimental)", "enum", "off",
+                          choices=[("off", "Off (recommended baseline)"), ("on", "On (not lattice-calibrated)")]),
+            ParameterSpec("mc_electronic_stopping_multiplier", "MC electronic stopping multiplier (research only)",
+                          "float", 1.0, 0.01, 1000.0, decimals=2, step=1.0),
             ParameterSpec("bias", "Bias voltage", "float", 0.0, 0.0, 10000.0, units="V"),
             ParameterSpec(
                 "plasma_density",
@@ -18983,6 +19484,11 @@ class ImplantationStep(ProcessStep):
             self.params.get("method", "Beam"),
             self.params.get("bias", 0.0),
             self.params.get("plasma_density", 5e11),
+            int(self.params.get("mc_trajectories", "5000")),
+            str(self.params.get("mc_deposition", "cic")),
+            float(self.params.get("mc_smoothing_nm", "0")),
+            str(self.params.get("mc_channeling", "off")).lower() == "on",
+            float(self.params.get("mc_electronic_stopping_multiplier", 1.0)),
         )
         return f"Implant {self.params['species']}"
 
@@ -19003,6 +19509,12 @@ class AnnealStep(ProcessStep):
             ParameterSpec("time", "Time", "float", 30.0, 0.0, 10000.0, units="s"),
             ParameterSpec("ambient", "Ambient", "enum", "N2", choices=ambients),
             ParameterSpec("ramp", "Ramp rate", "float", 5.0, 0.0, 200.0, units="°C/s"),
+            ParameterSpec(
+                "ted_mode", "Dopant diffusion model", "enum", "intrinsic",
+                choices=[("intrinsic", "Intrinsic (baseline)"),
+                         ("local", "Local bounded TED (experimental)")],
+                tooltip="Intrinsic is the calibrated-coefficient baseline. Local TED is a phenomenological defect-enhanced option (not experimentally calibrated).",
+            ),
         )
 
     def execute(self, model: ProcessModel) -> str:
@@ -19011,6 +19523,7 @@ class AnnealStep(ProcessStep):
             self.params["time"],
             self.params["ambient"],
             self.params["ramp"],
+            self.params.get("ted_mode", "intrinsic"),
         )
         return f"Anneal {self.params['temperature']:.0f}°C"
 
@@ -19079,6 +19592,7 @@ PROCESS_STEP_FACTORIES: Dict[str, Callable[[MaterialDatabase], ProcessStep]] = {
     "Post-Exposure Bake": PostExposureBakeStep,
     "Resist Develop": DevelopStep,
     "Deposition": DepositionStep,
+    "Lift-off": LiftOffStep,
     "Selective Epitaxy": SelectiveEpitaxyStep,
     "Etch": EtchStep,
     "CMP": CMPProcessStep,
@@ -19177,6 +19691,19 @@ def _headless_material_db_signature(material_db: MaterialDatabase) -> str:
     return h.hexdigest()
 
 
+def _migrate_deposition_pvd_controls(step: "ProcessStep", supplied_params: Any) -> None:
+    """Preserve old PVD recipes rather than silently changing their physics.
+
+    Existing recipes carry the four detailed PVD parameters but not pvd_controls.
+    New recipes explicitly carry pvd_controls='Simple' by default.
+    """
+    if getattr(step, "name", "") != "Deposition":
+        return
+    if isinstance(supplied_params, dict) and "pvd_controls" not in supplied_params:
+        step.params["pvd_controls"] = "Advanced"
+        step.params["directionality_user_set"] = True
+
+
 def _headless_deserialize_step(step_blob: Dict[str, Any], material_db: MaterialDatabase) -> Optional[ProcessStep]:
     name = str(step_blob.get("name", "") or "").strip()
     if not name or name not in PROCESS_STEP_FACTORIES:
@@ -19198,6 +19725,7 @@ def _headless_deserialize_step(step_blob: Dict[str, Any], material_db: MaterialD
     params = params_raw if isinstance(params_raw, dict) and params_raw else step_blob.get("params", {})
     if isinstance(params, dict):
         step.params.update(params)
+    _migrate_deposition_pvd_controls(step, params)
     step.enabled = bool(step_blob.get("enabled", True))
     if isinstance(step, ExposureStep):
         if "custom_mask" in step_blob:
@@ -22086,6 +22614,7 @@ class ParameterEditor(QtWidgets.QWidget):
         self.layout.setSpacing(6)
         self._current_step: Optional[ProcessStep] = None
         self._widget_map: Dict[str, QtWidgets.QWidget] = {}
+        self._label_map: Dict[str, QtWidgets.QLabel] = {}
         self._extra_widget: Optional[QtWidgets.QWidget] = None
 
     def set_step(self, step: Optional[ProcessStep]) -> None:
@@ -22096,6 +22625,7 @@ class ParameterEditor(QtWidgets.QWidget):
             if widget:
                 widget.deleteLater()
         self._widget_map.clear()
+        self._label_map.clear()
         self._extra_widget = None
         if step is None:
             return
@@ -22107,6 +22637,9 @@ class ParameterEditor(QtWidgets.QWidget):
                 widget.setToolTip(spec.tooltip)
             self.layout.addRow(label, widget)
             self._widget_map[spec.key] = widget
+            self._label_map[spec.key] = label
+        if isinstance(step, DepositionStep):
+            self._update_deposition_visibility()
         if isinstance(step, ExposureStep):
             tools_widget = QtWidgets.QWidget()
             tools_layout = QtWidgets.QHBoxLayout(tools_widget)
@@ -22172,9 +22705,43 @@ class ParameterEditor(QtWidgets.QWidget):
         widget.textChanged.connect(lambda text, k=key: self._update_param(k, text))
         return widget
 
+    def _update_deposition_visibility(self) -> None:
+        step = self._current_step
+        if not isinstance(step, DepositionStep):
+            return
+        method = str(step.params.get("method", "CVD")).lower()
+        advanced = str(step.params.get("pvd_controls", "Simple")).lower() == "advanced"
+        visible = {
+            "directionality": method in {"pvd", "cvd", "epitaxy"} and not (method == "pvd" and advanced),
+            "pvd_controls": method == "pvd",
+            "directionality_user_set": False,
+        }
+        for k in ("dopant_element", "dopant_conc", "dopant_mode"):
+            visible[k] = method in {"cvd", "ald", "epitaxy"}
+        for k in ("sticking", "source_sigma", "surface_diff", "resputter"):
+            visible[k] = method == "pvd" and advanced
+        for k, enabled in visible.items():
+            if k in self._widget_map:
+                self._widget_map[k].setVisible(enabled)
+            if k in self._label_map:
+                self._label_map[k].setVisible(enabled)
+
     def _update_param(self, key: str, value: Any) -> None:
-        if self._current_step is not None:
-            self._current_step.params[key] = value
+        step = self._current_step
+        if step is None:
+            return
+        step.params[key] = value
+        if isinstance(step, DepositionStep):
+            if key == "directionality":
+                step.params["directionality_user_set"] = True
+            elif key == "method" and not step.params.get("directionality_user_set", False):
+                defaults = {"pvd": 0.95, "cvd": 0.2, "ald": 0.0, "epitaxy": 0.1}
+                new_default = defaults.get(str(value).lower())
+                if new_default is not None:
+                    step.params["directionality"] = new_default
+                    self._set_widget_value("directionality", new_default)
+            if key in {"method", "pvd_controls"}:
+                self._update_deposition_visibility()
 
     def _set_widget_value(self, key: str, value: Any) -> None:
         widget = self._widget_map.get(key)
@@ -25504,6 +26071,7 @@ class SimulatorController:
         params = params_raw if isinstance(params_raw, dict) and params_raw else data.get("params", {})
         if isinstance(params, dict):
             step.params.update(params)
+        _migrate_deposition_pvd_controls(step, params)
         step.enabled = bool(data.get("enabled", True))
         if isinstance(step, ExposureStep):
             if "custom_mask" in data:
@@ -25990,7 +26558,7 @@ _TCAD_DEFAULT_SKILLS_MD: Dict[str, str] = {
             "",
             "### Deposition",
             "- keys：`material`, `thickness`, `method`, `coverage`, `temperature`, `directionality`, `gap_fill_bias`, `sticking`, `source_sigma`, `surface_diff`, `resputter`",
-            "- ALD in-situ doping keys：`dopant_element`, `dopant_conc`, `dopant_mode`（仅 `method=ALD` 有意义）",
+            "- CVD/ALD/Epitaxy in-situ doping keys：`dopant_element`, `dopant_conc`, `dopant_mode`（仅作用于新生长的材料 voxel）",
             "- sanity：`directionality` 0≈更共形；1≈更直线入射（PVD-like）。沟槽填充可用 `gap_fill_bias>0` + 低 directionality。",
             "",
             "### Selective Epitaxy",
@@ -31103,6 +31671,7 @@ def _webui_deserialize_step(data: Dict[str, Any], material_db: MaterialDatabase)
     params = params_raw if isinstance(params_raw, dict) and params_raw else data.get("params", {})
     if isinstance(params, dict):
         step.params.update(params)
+    _migrate_deposition_pvd_controls(step, params)
     step.enabled = bool(data.get("enabled", True))
     if isinstance(step, ExposureStep):
         # Migration: older exports did not have the "advanced_enable" master toggle; infer it from
@@ -70225,8 +70794,14 @@ def _webui_worker_main(
                 # Quantitative WebUI concentration slices (cm^-3).
                 # Species fields are distinct from the material identity grid.
                 species_key = str(payload.get("species", "total") or "total").strip()
-                is_doping = kind == "doping"
-                if is_doping:
+                is_doping = kind in {"doping", "damage", "interstitials", "vacancies", "mc_stops"}
+                if kind in {"damage", "interstitials", "vacancies", "mc_stops"}:
+                    # Existing physical fields, not synthetic doping data.
+                    attribute = {"damage": "damage_concentration", "interstitials": "interstitials", "vacancies": "vacancies", "mc_stops": "mc_last_stops"}[kind]
+                    dopant_array = getattr(model, attribute, None)
+                    if not isinstance(dopant_array, np.ndarray):
+                        dopant_array = np.zeros(model.grid.shape, dtype=np.float32)
+                elif kind == "doping":
                     model._ensure_doping_field()
                     fields = getattr(model, "dopant_species_fields", {}) or {}
                     if species_key.lower() == "total":
@@ -70247,6 +70822,7 @@ def _webui_worker_main(
                         dopant_array = next((arr for key, arr in fields.items() if str(key).upper() == symbol), None)
                         if dopant_array is None:
                             dopant_array = np.zeros(model.grid.shape, dtype=np.float32)
+                if is_doping:
                     if axis == "X":
                         section = dopant_array[index, :, :].T
                     elif axis == "Y":
@@ -70256,20 +70832,28 @@ def _webui_worker_main(
                     section = np.ascontiguousarray(section, dtype=np.float32)
                 else:
                     section = model.get_cross_section(axis, index).astype(np.uint16, copy=False)
-                # Align WebUI 2D preview axes with 3D convention (X-right, Y-up on the XoY wafer plane).
-                # For Z slices, transpose to show X horizontally and Y vertically.
+                # Align numerical and material fields with the same exact slice orientation.
                 if axis == "Z":
                     section = np.ascontiguousarray(section.T)
+                material_section = None
+                if is_doping:
+                    material_section = model.get_cross_section(axis, index).astype(np.uint16, copy=False)
+                    if axis == "Z":
+                        material_section = material_section.T
+                    material_section = np.ascontiguousarray(material_section, dtype=np.uint16)
+                    if material_section.shape != section.shape:
+                        raise ValueError("Material/numerical slice geometry mismatch")
                 payload_out = {
                     "axis": axis,
                     "index": int(index),
                     "index_max": int(index_max),
                     "shape": [int(section.shape[0]), int(section.shape[1])],
                     "dtype": "f32" if is_doping else "u16",
-                    "kind": "doping" if is_doping else "material",
-                    "species": species_key if is_doping else None,
+                    "kind": kind if is_doping else "material",
+                    "species": species_key if kind == "doping" else (kind if is_doping else None),
                     "units": "cm^-3" if is_doping else None,
                     "data_b64": base64.b64encode(section.tobytes(order="C")).decode("ascii"),
+                    "materials_b64": (base64.b64encode(material_section.tobytes(order="C")).decode("ascii") if material_section is not None else None),
                 }
                 conn.send({"ok": True, "result": payload_out, "rid": rid})
                 continue
@@ -80980,6 +81564,10 @@ _WEBUI_INDEX_HTML = r"""<!DOCTYPE html>
                     <option value="Sb">Antimony (Sb)</option>
                     <option value="Al">Aluminium (Al)</option>
                     <option value="Ga">Gallium (Ga)</option>
+                    <option value="mc_stops">MC raw stopping positions (cm⁻³)</option>
+                    <option value="damage">Implantation damage (cm⁻³)</option>
+                    <option value="interstitials">Interstitial defects (cm⁻³)</option>
+                    <option value="vacancies">Vacancy defects (cm⁻³)</option>
                   </select>
                 </label>
                 <label for="doping-scale-select" style="font-size:12px;display:flex;align-items:center;gap:5px;" title="Doping colour scale: integer powers of ten, with zero concentration shown as dark background">Scale
@@ -80987,6 +81575,15 @@ _WEBUI_INDEX_HTML = r"""<!DOCTYPE html>
                     <option value="fixed0" selected>From 10⁰ cm⁻³</option>
                     <option value="auto">Auto decades</option>
                   </select>
+                </label>
+                <label for="density-scale-type" style="font-size:12px;display:flex;align-items:center;gap:5px;">Mapping
+                  <select id="density-scale-type" title="Choose linear or logarithmic colour mapping">
+                    <option value="log" selected>Logarithmic</option>
+                    <option value="linear">Linear (0 to max)</option>
+                  </select>
+                </label>
+                <label style="font-size:12px;display:flex;align-items:center;gap:4px;" title="Draw thin boundaries wherever adjacent voxel material IDs differ">
+                  <input type="checkbox" id="slice-material-outlines" checked> Material outlines
                 </label>
                 <button class="btn btn-sm" id="refresh-slice-btn">刷新切片</button>
               </div>
@@ -82873,7 +83470,9 @@ const state = {
       sliceStepOverrides2: {}, // second slice per-step overrides
       // 2D multi-axis slice preview (show X/Y/Z slices simultaneously in a grid).
       slice2dMulti: false,
-      dopingScaleMode: 'auto', // 'fixed0' (10^0 baseline) or 'auto' (whole decades)
+      dopingScaleMode: 'fixed0', // logarithmic decades
+      densityScaleType: 'log',
+      sliceMaterialOutlines: true,
       slice2dAxes: { X: true, Y: false, Z: false },
       slice2dIndexX: 0,
       slice2dIndexY: 0,
@@ -86590,6 +87189,17 @@ function applyUiStateFromServer(ui) {
           changed = true;
         }
       } catch (e) {}
+      try {
+        const typ = ui.densityScaleType;
+        if (typ === 'log' || typ === 'linear') {
+          state.densityScaleType = typ;
+          const el = $('density-scale-type'); if (el) el.value = typ;
+        }
+        if (typeof ui.sliceMaterialOutlines === 'boolean') {
+          state.sliceMaterialOutlines = ui.sliceMaterialOutlines;
+          const el = $('slice-material-outlines'); if (el) el.checked = ui.sliceMaterialOutlines;
+        }
+      } catch (e) {}
       // 2D multi-axis slice preview (optional).
       try {
         const has = ('slice2dMulti' in ui) || ('slice_2d_multi' in ui) || ('sliceMulti2d' in ui) || ('slice_multi_2d' in ui);
@@ -86683,6 +87293,8 @@ function collectUiState() {
         sliceIndex2: clampInt(state.sliceIndex2, 0, axisMax(state.sliceAxis2)),
         slice2dMulti: !!state.slice2dMulti,
         dopingScaleMode: state.dopingScaleMode === 'auto' ? 'auto' : 'fixed0',
+        densityScaleType: state.densityScaleType === 'linear' ? 'linear' : 'log',
+        sliceMaterialOutlines: !!state.sliceMaterialOutlines,
         slice2dAxes: ax,
         slice2dIndexX: clampInt(state.slice2dIndexX, 0, axisMax('X')),
         slice2dIndexY: clampInt(state.slice2dIndexY, 0, axisMax('Y')),
@@ -88909,13 +89521,36 @@ function renderParams() {
     return out;
   };
   const specs = (variantSpecs && variantSpecs.length) ? mergeSpecs(baseSpecs, variantSpecs) : baseSpecs;
+  const isDeposition = !!(step && step.name === 'Deposition');
+  const depMethod = isDeposition ? String((step.params && step.params.method) || 'CVD').trim().toLowerCase() : '';
+  const pvdMode = isDeposition ? String((step.params && step.params.pvd_controls) || 'Simple').trim().toLowerCase() : '';
+  const pvdAdvancedKeys = new Set(['sticking', 'source_sigma', 'surface_diff', 'resputter']);
   const exposureAdvancedKeys = new Set(['wavelength','na','sigma','focus','dose','opc_enable','opc_mode','opc_bias_nm','opc_max_pixels','opc_cd_limit','opc_apply_to_custom']);
   const exposureProceduralOnly = new Set(['pattern','critical_dimension','pitch','orientation']);
   const exposureCustomOnly = new Set(['mask_name','mask_file','opc_apply_to_custom']);
   const exposureModeNow = String(exposureMode || 'Custom').trim().toLowerCase();
   const exposureIsProcedural = exposureModeNow === 'procedural';
   const exposureIsCustom = (exposureModeNow === 'custom' || exposureModeNow === 'designer' || exposureModeNow === 'image');
+  if (isDeposition && depMethod === 'pvd') {
+    const info = document.createElement('div');
+    info.className = 'muted';
+    info.style.cssText = 'font-size:12px;padding:6px 8px;margin:0 0 8px;border-left:3px solid #80aadd;';
+    info.textContent = (pvdMode === 'advanced')
+      ? 'PVD Advanced: sticking, source angle, surface diffusion and resputter control deposition; the Directionality preset is not applied.'
+      : 'PVD Simple: Directionality 0 = conformal, 1 = nearly vertical evaporation. Detailed PVD settings are ignored.';
+    container.appendChild(info);
+  }
   for (const spec of specs) {
+    if (isDeposition) {
+      const dk = String(spec.key || '');
+      if (dk === 'directionality_user_set') continue; // saved internally, not shown
+      if (dk === 'pvd_controls' && depMethod !== 'pvd') continue;
+      if (['dopant_element','dopant_conc','dopant_mode'].includes(dk) &&
+          !['cvd','ald','epitaxy'].includes(depMethod)) continue;
+      if (pvdAdvancedKeys.has(dk) && !(depMethod === 'pvd' && pvdMode === 'advanced')) continue;
+      if (dk === 'directionality' && (depMethod === 'pvd' && pvdMode === 'advanced' ||
+                                   depMethod === 'ald' || depMethod === 'electroplate')) continue;
+    }
     if (isExposure) {
       const key = String(spec.key || '');
       if (!exposureAdvEnabled && exposureAdvancedKeys.has(key)) continue;
@@ -89013,7 +89648,22 @@ function renderParams() {
         } else {
           step.params[spec.key] = sel.value;
         }
+        if (isDeposition && String(spec.key || '') === 'method') {
+          // Suggested defaults only if no explicit user choice has been made.
+          const wasEdited = !!(step.params && (step.params.directionality_user_set === true ||
+                       String(step.params.directionality_user_set).toLowerCase() === 'true'));
+          if (!wasEdited) {
+            const defaults = {pvd:0.95, cvd:0.2, ald:0.0, epitaxy:0.1};
+            const next = String(sel.value || '').toLowerCase();
+            if (Object.prototype.hasOwnProperty.call(defaults, next)) {
+              step.params.directionality = defaults[next];
+            }
+          }
+        }
         scheduleApplyParams(0);
+        if (isDeposition && (String(spec.key || '') === 'method' || String(spec.key || '') === 'pvd_controls')) {
+          renderParams();
+        }
         // Mask Exposure has conditional parameter sections; re-render when gates change.
         try {
           if (isExposure && (String(spec.key || '') === 'mask_mode' || String(spec.key || '') === 'advanced_enable')) {
@@ -89032,6 +89682,9 @@ function renderParams() {
       input.value = (step.params && step.params[spec.key] !== undefined) ? step.params[spec.key] : (spec.default ?? '');
       input.addEventListener('input', () => {
         const raw = input.value;
+        if (isDeposition && String(spec.key || '') === 'directionality') {
+          step.params.directionality_user_set = true;
+        }
         if (spec.type === 'float') {
           const v = parseFloat(raw);
           if (!Number.isNaN(v)) { step.params[spec.key] = v; scheduleApplyParams(220); }
@@ -96431,30 +97084,28 @@ function renderLegendForSlice(dataU16OrList) {
       }
     }
 
-    // Integer-decade logarithmic concentration scales.
-    // Exact zero (and sub-1 cm^-3 numerical noise) is shown as the dark background,
-    // because log10(0) is undefined. The fixed baseline 10^0 cm^-3 is therefore
-    // the lowest *positive* plotted concentration, not a claim that log10(0) = 0.
+    // Shared numeric-field scaling. Zero is genuinely valid on the linear scale.
+    // On the logarithmic scale zero and values below 1 cm^-3 are background.
     function dopingSliceStats(slice) {
       if (!slice || !slice.doping || !slice.data) return null;
+      const linear = state.densityScaleType === 'linear';
       let negative = 0, positive = 0, nonzero = 0;
       let rawMin = Infinity, rawMax = 0;
       for (let i = 0; i < slice.data.length; i++) {
         const v = Number(slice.data[i]);
-        if (!Number.isFinite(v) || Math.abs(v) < 1) continue;
+        if (!Number.isFinite(v) || Math.abs(v) < (linear ? Number.MIN_VALUE : 1)) continue;
         negative += (v < 0 ? 1 : 0); positive += (v > 0 ? 1 : 0);
-        const a = Math.abs(v); rawMin = Math.min(rawMin, a); rawMax = Math.max(rawMax, a);
+        const a = Math.abs(v);
+        rawMin = Math.min(rawMin, a); rawMax = Math.max(rawMax, a);
         nonzero++;
       }
-      const fixed0 = state.dopingScaleMode !== 'auto';
-      if (!nonzero) return {nonzero:0, positive:0, negative:0, rawMin:0, rawMax:0, lo:0, hi:1, distinct:false};
+      if (!nonzero) return {nonzero:0, positive:0, negative:0, rawMin:0, rawMax:0, lo:0, hi:1, distinct:false, linear};
+      if (linear) return {nonzero, positive, negative, rawMin, rawMax, lo:0, hi:rawMax || 1, distinct:rawMax > rawMin, linear};
       const logMin = Math.log10(rawMin), logMax = Math.log10(rawMax);
-      const distinct = (logMax - logMin > 0.05);
-      // Outward rounding prevents clipping any data and guarantees integer labels.
-      let lo = fixed0 ? 0 : Math.floor(logMin + 1e-6);
-      //let lo = Math.floor(logMin);
-      let hi = Math.max(lo + 1, Math.ceil(logMax - 1e-6));
-      return {nonzero, positive, negative, rawMin, rawMax, lo, hi, distinct};
+      const fixed0 = state.dopingScaleMode !== 'auto';
+      const lo = fixed0 ? 0 : Math.floor(logMin + 1e-6);
+      const hi = Math.max(lo + 1, Math.ceil(logMax - 1e-6));
+      return {nonzero, positive, negative, rawMin, rawMax, lo, hi, distinct:(logMax-logMin > .05), linear};
     }
             function drawSliceToCanvas(slice, canvas, opts = null) {
               if (!canvas) return;
@@ -96721,10 +97372,28 @@ function renderLegendForSlice(dataU16OrList) {
 
           const di = (y2 * wOut + x2) | 0;
           if (slice.doping) {
-            if (!Number.isFinite(id) || Math.abs(id) < 1) { out32[di] = bg32; continue; }
-            const t = Math.max(0, Math.min(1, (Math.log10(Math.abs(id)) - dopingStats.lo) / Math.max(0.001, dopingStats.hi - dopingStats.lo)));
-            const [r, g, b] = dopingRgbAt(t, slice.species === 'net' && id < 0);
-            out32[di] = (r | (g << 8) | (b << 16) | (255 << 24)) >>> 0;
+            const magnitude = Math.abs(id);
+            const threshold = dopingStats.linear ? 0 : 1;
+            if (!Number.isFinite(id) || magnitude <= 0 || (!dopingStats.linear && magnitude < 1)) {
+              out32[di] = bg32;
+            } else {
+              const t = dopingStats.linear
+                ? magnitude / Math.max(Number.MIN_VALUE, dopingStats.hi)
+                : (Math.log10(magnitude) - dopingStats.lo) / Math.max(0.001, dopingStats.hi - dopingStats.lo);
+              const [r, g, b] = dopingRgbAt(Math.max(0, Math.min(1, t)), slice.species === 'net' && id < 0);
+              out32[di] = (r | (g << 8) | (b << 16) | (255 << 24)) >>> 0;
+            }
+            // Boundary detection uses raw grid indices, then applies the SAME
+            // flip, rotation and mirroring as the numerical heatmap pixel.
+            // Avoid double-wide edges and never hide an entire material region.
+            if (state.sliceMaterialOutlines && slice.materials && slice.materials.length === w*h) {
+              const mat = slice.materials;
+              const m = mat[row+x];
+              if ((x > 0 && mat[row+x-1] !== m) ||
+                  (y > 0 && mat[row-w+x] !== m)) {
+                out32[di] = (245 | (245 << 8) | (245 << 16) | (255 << 24)) >>> 0;
+              }
+            }
             continue;
           }
           if (!id) { out32[di] = bg32; continue; }
@@ -96806,6 +97475,14 @@ function renderLegendForSlice(dataU16OrList) {
       if (ev.target && ev.target.id === 'slice-field-select') {
         try { refreshSlice(true, 'multi'); } catch (e) {}
       }
+      if (ev.target && ev.target.id === 'density-scale-type') {
+        state.densityScaleType = ev.target.value === 'linear' ? 'linear' : 'log';
+        try { drawSliceFromCache(); updateSliceLegend(); scheduleUiStatePersist(520); } catch(e) {}
+      }
+      if (ev.target && ev.target.id === 'slice-material-outlines') {
+        state.sliceMaterialOutlines = !!ev.target.checked;
+        try { drawSliceFromCache(); scheduleUiStatePersist(520); } catch(e) {}
+      }
       if (ev.target && ev.target.id === 'doping-scale-select') {
         state.dopingScaleMode = ev.target.value === 'auto' ? 'auto' : 'fixed0';
         // Recolor already-loaded slices; no simulation or data transfer is required.
@@ -96817,7 +97494,7 @@ function renderLegendForSlice(dataU16OrList) {
     function selectedSliceField() {
       const el = $('slice-field-select');
       const v = el ? String(el.value || 'material') : 'material';
-      return {kind: v === 'material' ? 'material' : 'doping', species: v};
+      return {kind: v === 'material' ? 'material' : (['damage','interstitials','vacancies','mc_stops'].includes(v) ? v : 'doping'), species: v};
     }
     function decodeSliceResponse(r, axis, idx) {
       const shape = r.shape || [0, 0];
@@ -96830,20 +97507,29 @@ function renderLegendForSlice(dataU16OrList) {
       // Ensure alignment even if the base64 decoder's byteOffset is unaligned.
       const aligned = bytes.slice(0, h * ww * stride);
       const data = doping ? new Float32Array(aligned.buffer) : new Uint16Array(aligned.buffer);
+      let materials = null;
+      if (doping && r.materials_b64) {
+        const mb = _b64ToBytes(r.materials_b64);
+        if (mb.byteLength >= h*ww*2) {
+          const packed = mb.slice(0, h*ww*2);
+          materials = new Uint16Array(packed.buffer);
+        }
+      }
       const ax = String(r.axis || axis).toUpperCase();
       const ii = parseInt(r.index) || idx;
       const mx = parseInt(r.index_max);
-      return {axis: ax, index: ii, index_max: Number.isFinite(mx) ? mx : axisMax(ax), w: ww, h, data, doping, species: r.species || 'total'};
+      return {axis: ax, index: ii, index_max: Number.isFinite(mx) ? mx : axisMax(ax), w: ww, h, data, doping, materials, species: r.species || 'total'};
     }
     // Show integer-decade ticks along a continuous magnitude colour bar.
     // CUSTOM_DOPING_COLORMAP_START
     // Paste your Matplotlib RGB lookup table here (usually 256 [R,G,B] entries).
     // Empty array = use the simulator's original blue -> yellow gradient.
-
     // Example: const DOPING_COLORMAP = [[68,1,84], [253,231,37]];
-    const DOPING_COLORMAP = [[48, 18, 59], [50, 21, 67], [51, 24, 74], [52, 27, 81], [53, 30, 88], [54, 33, 95], [55, 36, 102], [56, 39, 109], [57, 42, 115], [58, 45, 121], [59, 47, 128], [60, 50, 134], [61, 53, 139], [62, 56, 145], [63, 59, 151], [63, 62, 156], [64, 64, 162], [65, 67, 167], [65, 70, 172], [66, 73, 177], [66, 75, 181], [67, 78, 186], [68, 81, 191], [68, 84, 195], [68, 86, 199], [69, 89, 203], [69, 92, 207], [69, 94, 211], [70, 97, 214], [70, 100, 218], [70, 102, 221], [70, 105, 224], [70, 107, 227], [71, 110, 230], [71, 113, 233], [71, 115, 235], [71, 118, 238], [71, 120, 240], [71, 123, 242], [70, 125, 244], [70, 128, 246], [70, 130, 248], [70, 133, 250], [70, 135, 251], [69, 138, 252], [69, 140, 253], [68, 143, 254], [67, 145, 254], [66, 148, 255], [65, 150, 255], [64, 153, 255], [62, 155, 254], [61, 158, 254], [59, 160, 253], [58, 163, 252], [56, 165, 251], [55, 168, 250], [53, 171, 248], [51, 173, 247], [49, 175, 245], [47, 178, 244], [46, 180, 242], [44, 183, 240], [42, 185, 238], [40, 188, 235], [39, 190, 233], [37, 192, 231], [35, 195, 228], [34, 197, 226], [32, 199, 223], [31, 201, 221], [30, 203, 218], [28, 205, 216], [27, 208, 213], [26, 210, 210], [26, 212, 208], [25, 213, 205], [24, 215, 202], [24, 217, 200], [24, 219, 197], [24, 221, 194], [24, 222, 192], [24, 224, 189], [25, 226, 187], [25, 227, 185], [26, 228, 182], [28, 230, 180], [29, 231, 178], [31, 233, 175], [32, 234, 172], [34, 235, 170], [37, 236, 167], [39, 238, 164], [42, 239, 161], [44, 240, 158], [47, 241, 155], [50, 242, 152], [53, 243, 148], [56, 244, 145], [60, 245, 142], [63, 246, 138], [67, 247, 135], [70, 248, 132], [74, 248, 128], [78, 249, 125], [82, 250, 122], [85, 250, 118], [89, 251, 115], [93, 252, 111], [97, 252, 108], [101, 253, 105], [105, 253, 102], [109, 254, 98], [113, 254, 95], [117, 254, 92], [121, 254, 89], [125, 255, 86], [128, 255, 83], [132, 255, 81], [136, 255, 78], [139, 255, 75], [143, 255, 73], [146, 255, 71], [150, 254, 68], [153, 254, 66], [156, 254, 64], [159, 253, 63], [161, 253, 61], [164, 252, 60], [167, 252, 58], [169, 251, 57], [172, 251, 56], [175, 250, 55], [177, 249, 54], [180, 248, 54], [183, 247, 53], [185, 246, 53], [188, 245, 52], [190, 244, 52], [193, 243, 52], [195, 241, 52], [198, 240, 52], [200, 239, 52], [203, 237, 52], [205, 236, 52], [208, 234, 52], [210, 233, 53], [212, 231, 53], [215, 229, 53], [217, 228, 54], [219, 226, 54], [221, 224, 55], [223, 223, 55], [225, 221, 55], [227, 219, 56], [229, 217, 56], [231, 215, 57], [233, 213, 57], [235, 211, 57], [236, 209, 58], [238, 207, 58], [239, 205, 58], [241, 203, 58], [242, 201, 58], [244, 199, 58], [245, 197, 58], [246, 195, 58], [247, 193, 58], [248, 190, 57], [249, 188, 57], [250, 186, 57], [251, 184, 56], [251, 182, 55], [252, 179, 54], [252, 177, 54], [253, 174, 53], [253, 172, 52], [254, 169, 51], [254, 167, 50], [254, 164, 49], [254, 161, 48], [254, 158, 47], [254, 155, 45], [254, 153, 44], [254, 150, 43], [254, 147, 42], [254, 144, 41], [253, 141, 39], [253, 138, 38], [252, 135, 37], [252, 132, 35], [251, 129, 34], [251, 126, 33], [250, 123, 31], [249, 120, 30], [249, 117, 29], [248, 114, 28], [247, 111, 26], [246, 108, 25], [245, 105, 24], [244, 102, 23], [243, 99, 21], [242, 96, 20], [241, 93, 19], [240, 91, 18], [239, 88, 17], [237, 85, 16], [236, 83, 15], [235, 80, 14], [234, 78, 13], [232, 75, 12], [231, 73, 12], [229, 71, 11], [228, 69, 10], [226, 67, 10], [225, 65, 9], [223, 63, 8], [221, 61, 8], [220, 59, 7], [218, 57, 7], [216, 55, 6], [214, 53, 6], [212, 51, 5], [210, 49, 5], [208, 47, 5], [206, 45, 4], [204, 43, 4], [202, 42, 4], [200, 40, 3], [197, 38, 3], [195, 37, 3], [193, 35, 2], [190, 33, 2], [188, 32, 2], [185, 30, 2], [183, 29, 2], [180, 27, 1], [178, 26, 1], [175, 24, 1], [172, 23, 1], [169, 22, 1], [167, 20, 1], [164, 19, 1], [161, 18, 1], [158, 16, 1], [155, 15, 1], [152, 14, 1], [149, 13, 1], [146, 11, 1], [142, 10, 1], [139, 9, 2], [136, 8, 2], [133, 7, 2], [129, 6, 2], [126, 5, 2], [122, 4, 3]];
-
-        // Normalize and validate the table once, not once per displayed pixel.
+    const DOPING_COLORMAP = [
+      // PASTE YOUR [R, G, B] TRIPLETS HERE.
+      [48, 18, 59], [50, 21, 67], [51, 24, 74], [52, 27, 81], [53, 30, 88], [54, 33, 95], [55, 36, 102], [56, 39, 109], [57, 42, 115], [58, 45, 121], [59, 47, 128], [60, 50, 134], [61, 53, 139], [62, 56, 145], [63, 59, 151], [63, 62, 156], [64, 64, 162], [65, 67, 167], [65, 70, 172], [66, 73, 177], [66, 75, 181], [67, 78, 186], [68, 81, 191], [68, 84, 195], [68, 86, 199], [69, 89, 203], [69, 92, 207], [69, 94, 211], [70, 97, 214], [70, 100, 218], [70, 102, 221], [70, 105, 224], [70, 107, 227], [71, 110, 230], [71, 113, 233], [71, 115, 235], [71, 118, 238], [71, 120, 240], [71, 123, 242], [70, 125, 244], [70, 128, 246], [70, 130, 248], [70, 133, 250], [70, 135, 251], [69, 138, 252], [69, 140, 253], [68, 143, 254], [67, 145, 254], [66, 148, 255], [65, 150, 255], [64, 153, 255], [62, 155, 254], [61, 158, 254], [59, 160, 253], [58, 163, 252], [56, 165, 251], [55, 168, 250], [53, 171, 248], [51, 173, 247], [49, 175, 245], [47, 178, 244], [46, 180, 242], [44, 183, 240], [42, 185, 238], [40, 188, 235], [39, 190, 233], [37, 192, 231], [35, 195, 228], [34, 197, 226], [32, 199, 223], [31, 201, 221], [30, 203, 218], [28, 205, 216], [27, 208, 213], [26, 210, 210], [26, 212, 208], [25, 213, 205], [24, 215, 202], [24, 217, 200], [24, 219, 197], [24, 221, 194], [24, 222, 192], [24, 224, 189], [25, 226, 187], [25, 227, 185], [26, 228, 182], [28, 230, 180], [29, 231, 178], [31, 233, 175], [32, 234, 172], [34, 235, 170], [37, 236, 167], [39, 238, 164], [42, 239, 161], [44, 240, 158], [47, 241, 155], [50, 242, 152], [53, 243, 148], [56, 244, 145], [60, 245, 142], [63, 246, 138], [67, 247, 135], [70, 248, 132], [74, 248, 128], [78, 249, 125], [82, 250, 122], [85, 250, 118], [89, 251, 115], [93, 252, 111], [97, 252, 108], [101, 253, 105], [105, 253, 102], [109, 254, 98], [113, 254, 95], [117, 254, 92], [121, 254, 89], [125, 255, 86], [128, 255, 83], [132, 255, 81], [136, 255, 78], [139, 255, 75], [143, 255, 73], [146, 255, 71], [150, 254, 68], [153, 254, 66], [156, 254, 64], [159, 253, 63], [161, 253, 61], [164, 252, 60], [167, 252, 58], [169, 251, 57], [172, 251, 56], [175, 250, 55], [177, 249, 54], [180, 248, 54], [183, 247, 53], [185, 246, 53], [188, 245, 52], [190, 244, 52], [193, 243, 52], [195, 241, 52], [198, 240, 52], [200, 239, 52], [203, 237, 52], [205, 236, 52], [208, 234, 52], [210, 233, 53], [212, 231, 53], [215, 229, 53], [217, 228, 54], [219, 226, 54], [221, 224, 55], [223, 223, 55], [225, 221, 55], [227, 219, 56], [229, 217, 56], [231, 215, 57], [233, 213, 57], [235, 211, 57], [236, 209, 58], [238, 207, 58], [239, 205, 58], [241, 203, 58], [242, 201, 58], [244, 199, 58], [245, 197, 58], [246, 195, 58], [247, 193, 58], [248, 190, 57], [249, 188, 57], [250, 186, 57], [251, 184, 56], [251, 182, 55], [252, 179, 54], [252, 177, 54], [253, 174, 53], [253, 172, 52], [254, 169, 51], [254, 167, 50], [254, 164, 49], [254, 161, 48], [254, 158, 47], [254, 155, 45], [254, 153, 44], [254, 150, 43], [254, 147, 42], [254, 144, 41], [253, 141, 39], [253, 138, 38], [252, 135, 37], [252, 132, 35], [251, 129, 34], [251, 126, 33], [250, 123, 31], [249, 120, 30], [249, 117, 29], [248, 114, 28], [247, 111, 26], [246, 108, 25], [245, 105, 24], [244, 102, 23], [243, 99, 21], [242, 96, 20], [241, 93, 19], [240, 91, 18], [239, 88, 17], [237, 85, 16], [236, 83, 15], [235, 80, 14], [234, 78, 13], [232, 75, 12], [231, 73, 12], [229, 71, 11], [228, 69, 10], [226, 67, 10], [225, 65, 9], [223, 63, 8], [221, 61, 8], [220, 59, 7], [218, 57, 7], [216, 55, 6], [214, 53, 6], [212, 51, 5], [210, 49, 5], [208, 47, 5], [206, 45, 4], [204, 43, 4], [202, 42, 4], [200, 40, 3], [197, 38, 3], [195, 37, 3], [193, 35, 2], [190, 33, 2], [188, 32, 2], [185, 30, 2], [183, 29, 2], [180, 27, 1], [178, 26, 1], [175, 24, 1], [172, 23, 1], [169, 22, 1], [167, 20, 1], [164, 19, 1], [161, 18, 1], [158, 16, 1], [155, 15, 1], [152, 14, 1], [149, 13, 1], [146, 11, 1], [142, 10, 1], [139, 9, 2], [136, 8, 2], [133, 7, 2], [129, 6, 2], [126, 5, 2], [122, 4, 3]
+    ];
+    // Normalize and validate the table once, not once per displayed pixel.
     const DOPING_COLOR_TABLE = (
       Array.isArray(DOPING_COLORMAP) && DOPING_COLORMAP.length >= 2 &&
       DOPING_COLORMAP.every(c => Array.isArray(c) && c.length >= 3 &&
@@ -96876,38 +97562,42 @@ function renderLegendForSlice(dataU16OrList) {
     // CUSTOM_DOPING_COLORMAP_END
     function dopingDecadeLegendHtml(st) {
       if (!st || !st.nonzero) return '';
-      const span = Math.max(1, st.hi - st.lo);
-      const step = Math.max(1, Math.ceil(span / 6));
-      const exps = [st.lo];
-      for (let e = st.lo + step; e < st.hi; e += step) exps.push(e);
-      exps.push(st.hi);
-      const ticks = exps.map(e => '<span>10<sup>' + e + '</sup></span>').join('');
-      return '<div style="margin-top:8px;max-width:300px">' +
-        '<div style="height:12px;border:1px solid rgba(255,255,255,.45);border-radius:2px;' +
-        'background:' + dopingGradientCss() + '"></div>' +
-        '<div style="display:flex;justify-content:space-between;font-size:11px;margin-top:3px">' + ticks + '</div>' +
-        '<div style="font-size:11px;margin-top:2px">Magnitude (cm⁻³); 0 = dark background</div></div>';
+      let ticks = '';
+      if (st.linear) {
+        ticks = [0, .25, .5, .75, 1].map(f => '<span>' + (st.hi*f).toExponential(1) + '</span>').join('');
+      } else {
+        const span = Math.max(1, st.hi-st.lo), step = Math.max(1,Math.ceil(span/6));
+        const exps = [st.lo];
+        for (let e=st.lo+step; e<st.hi; e+=step) exps.push(e);
+        exps.push(st.hi);
+        ticks = exps.map(e => '<span>10<sup>'+e+'</sup></span>').join('');
+      }
+      return '<div style="margin-top:8px;max-width:340px">' +
+        '<div style="height:12px;border:1px solid rgba(255,255,255,.45);border-radius:2px;background:' + dopingGradientCss() + '"></div>' +
+        '<div style="display:flex;justify-content:space-between;font-size:10px;margin-top:3px">' + ticks + '</div>' +
+        '<div style="font-size:11px;margin-top:2px">Magnitude (cm⁻³); zero = dark background</div></div>';
     }
     function updateSliceLegend() {
-      const el = $('materials-legend');
-      if (!el) return;
-      const field = selectedSliceField();
-      if (field.kind === 'material') return;
-      const slices = [state.slice2dLastX, state.slice2dLastY, state.slice2dLastZ, state.sliceLast].filter(x => x && x.doping && x.species === field.species);
+      const el = $('materials-legend'); if (!el) return;
+      const field = selectedSliceField(); if (field.kind === 'material') return;
+      const slices = [state.slice2dLastX,state.slice2dLastY,state.slice2dLastZ,state.sliceLast]
+        .filter(x => x && x.doping && x.species === field.species);
       const slice = slices.length ? slices[slices.length-1] : null;
       const st = dopingSliceStats(slice);
+      const fieldLabel = {damage:'Implantation damage',interstitials:'Interstitial defects',vacancies:'Vacancy defects',mc_stops:'MC raw stops'}[field.species] || field.species;
       let message = 'No concentration slice loaded';
       if (st && st.nonzero) {
-        message = 'Min nonzero: ' + st.rawMin.toExponential(2) + ' cm⁻³<br>Max: ' + st.rawMax.toExponential(2) + ' cm⁻³<br>' +
-          'Colour range: 10^' + st.lo + ' to 10^' + st.hi + ' cm⁻³ (integer decades)<br>' +
-          'Zero / |N| &lt; 1 cm⁻³: dark background<br>' +
-          'Nonzero voxels: ' + st.nonzero;
+        message = 'Min nonzero: '+st.rawMin.toExponential(2)+' cm⁻³<br>Max: '+st.rawMax.toExponential(2)+' cm⁻³<br>' +
+          (st.linear ? 'Colour range: 0 to '+st.hi.toExponential(2)+' cm⁻³ (linear)' :
+            'Colour range: 10^'+st.lo+' to 10^'+st.hi+' cm⁻³ (integer decades)') + '<br>' +
+          (st.linear ? 'Zero: dark background' : 'Zero / |N| &lt; 1 cm⁻³: dark background') +
+          '<br>Nonzero voxels: '+st.nonzero;
         if (!st.distinct) message += '<br><b>Nearly uniform concentration in this slice</b>';
-        if (field.species === 'net') message += '<br>Donor voxels: ' + st.positive + '; acceptor voxels: ' + st.negative;
-      } else if (st) message = 'No nonzero dopant concentrations on this slice';
+        if (field.species === 'net') message += '<br>Donor voxels: '+st.positive+'; acceptor voxels: '+st.negative;
+      } else if (st) message = 'No nonzero concentrations on this slice';
       el.innerHTML = '<div style="padding:5px;color:white;line-height:1.5;font-size:13px">' +
-        '<b>Concentration: ' + field.species + '</b><br>log₁₀(|N| / cm⁻³)<br>' +
-        (DOPING_COLOR_TABLE ? '<span>Custom colormap: low → high</span>' : '<span style="color:#91caff">Blue: low</span> → <span style="color:#ffca62">Yellow: high</span>') +
+        '<b>'+fieldLabel+'</b><br>'+(state.densityScaleType === 'linear' ? 'Linear magnitude' : 'log₁₀(|N| / cm⁻³)')+'<br>' +
+        (DOPING_COLOR_TABLE ? 'Custom colormap: low → high' : '<span style="color:#91caff">Blue: low</span> → <span style="color:#ffca62">Yellow: high</span>') +
         (field.species === 'net' ? '<br>Pink: acceptor dominated' : '') + '<br>' + message +
         dopingDecadeLegendHtml(st) + '</div>';
     }
@@ -96975,17 +97665,17 @@ function renderLegendForSlice(dataU16OrList) {
         if (resX) {
           state.slice2dIndexX = resX.index;
           state.slice2dMaxX = resX.index_max;
-          state.slice2dLastX = { axis: resX.axis, index: resX.index, w: resX.w, h: resX.h, data: resX.data, doping: resX.doping, species: resX.species };
+          state.slice2dLastX = { axis: resX.axis, index: resX.index, w: resX.w, h: resX.h, data: resX.data, doping: resX.doping, materials: resX.materials, species: resX.species };
         }
         if (resY) {
           state.slice2dIndexY = resY.index;
           state.slice2dMaxY = resY.index_max;
-          state.slice2dLastY = { axis: resY.axis, index: resY.index, w: resY.w, h: resY.h, data: resY.data, doping: resY.doping, species: resY.species };
+          state.slice2dLastY = { axis: resY.axis, index: resY.index, w: resY.w, h: resY.h, data: resY.data, doping: resY.doping, materials: resY.materials, species: resY.species };
         }
         if (resZ) {
           state.slice2dIndexZ = resZ.index;
           state.slice2dMaxZ = resZ.index_max;
-          state.slice2dLastZ = { axis: resZ.axis, index: resZ.index, w: resZ.w, h: resZ.h, data: resZ.data, doping: resZ.doping, species: resZ.species };
+          state.slice2dLastZ = { axis: resZ.axis, index: resZ.index, w: resZ.w, h: resZ.h, data: resZ.data, doping: resZ.doping, materials: resZ.materials, species: resZ.species };
         }
 
         try { syncSliceControls2dMulti(false); } catch (e) {}
@@ -97058,13 +97748,13 @@ function renderLegendForSlice(dataU16OrList) {
         state.sliceAxis = res1.axis;
         state.sliceIndex = res1.index;
         state.sliceMax = res1.index_max;
-        state.sliceLast = { axis: res1.axis, index: res1.index, w: res1.w, h: res1.h, data: res1.data, doping: res1.doping, species: res1.species };
+        state.sliceLast = { axis: res1.axis, index: res1.index, w: res1.w, h: res1.h, data: res1.data, doping: res1.doping, materials: res1.materials, species: res1.species };
       }
       if (res2) {
         state.sliceAxis2 = res2.axis;
         state.sliceIndex2 = res2.index;
         state.sliceMax2 = res2.index_max;
-        state.sliceLast2 = { axis: res2.axis, index: res2.index, w: res2.w, h: res2.h, data: res2.data, doping: res2.doping, species: res2.species };
+        state.sliceLast2 = { axis: res2.axis, index: res2.index, w: res2.w, h: res2.h, data: res2.data, doping: res2.doping, materials: res2.materials, species: res2.species };
       }
 
       try { syncSliceControls(false); } catch (e) {}
